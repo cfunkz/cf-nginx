@@ -1,0 +1,129 @@
+#!/bin/bash
+# Manual Cloudflare IP insertion helper
+# Use this if automatic insertion fails
+
+set -e
+
+source /usr/lib/cf-nginx/cf-ips.sh
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}❌ This script must be run as root${NC}"
+    exit 1
+fi
+
+if [[ -z "$1" ]]; then
+    echo "Usage: $0 <site-name>"
+    echo ""
+    echo "This script generates CF IP directives that you can manually paste"
+    echo "into your NGINX config if automatic insertion fails."
+    exit 1
+fi
+
+SITE="$1"
+CONFIG_FILE="/etc/nginx/sites-available/$SITE"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo -e "${RED}❌ Config not found: $CONFIG_FILE${NC}"
+    exit 1
+fi
+
+echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  Manual CF IP Directive Generator     ║${NC}"
+echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
+echo ""
+
+# Fetch latest IPs
+echo -e "${YELLOW}Fetching latest Cloudflare IPs...${NC}"
+fetch_cf_ips
+echo ""
+
+# Show the config structure
+echo -e "${YELLOW}Current NGINX config structure:${NC}"
+echo -e "${BLUE}────────────────────────────────────────${NC}"
+grep -n "server\|server_name\|listen" "$CONFIG_FILE" | head -20
+echo -e "${BLUE}────────────────────────────────────────${NC}"
+echo ""
+
+# Generate the directives
+echo -e "${YELLOW}📋 Copy these lines and paste them after 'server_name' in EACH server block:${NC}"
+echo ""
+echo -e "${GREEN}────────────────────────────────────────${NC}"
+echo ""
+echo "    # BEGIN CLOUDFLARE IPS - DO NOT EDIT MANUALLY"
+generate_real_ip_directives
+echo "    # END CLOUDFLARE IPS"
+echo ""
+echo -e "${GREEN}────────────────────────────────────────${NC}"
+echo ""
+
+# Show example placement
+echo -e "${YELLOW}Example placement:${NC}"
+echo ""
+cat << 'EOF'
+server {
+    server_name example.com;
+
+    # BEGIN CLOUDFLARE IPS - DO NOT EDIT MANUALLY
+    set_real_ip_from 103.21.244.0/22;
+    ...
+    # END CLOUDFLARE IPS
+
+    location / {
+        ...
+    }
+}
+EOF
+echo ""
+
+# Offer to open editor
+echo -e "${YELLOW}Would you like to edit the config now? (y/N): ${NC}"
+read -r edit_now
+
+if [[ "$edit_now" =~ ^[Yy]$ ]]; then
+    # Create backup first
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak-$(date +%s)"
+    echo -e "${GREEN}✅ Backup created${NC}"
+    echo ""
+    
+    # Open in editor
+    ${EDITOR:-nano} "$CONFIG_FILE"
+    
+    echo ""
+    echo -e "${YELLOW}Testing NGINX config...${NC}"
+    if nginx -t 2>&1 | grep -q "successful"; then
+        echo -e "${GREEN}✅ Config test passed!${NC}"
+        echo ""
+        echo -n "Reload NGINX now? (y/N): "
+        read -r reload_now
+        
+        if [[ "$reload_now" =~ ^[Yy]$ ]]; then
+            systemctl reload nginx
+            echo -e "${GREEN}✅ NGINX reloaded${NC}"
+            
+            # Mark as enabled
+            enable_site "$SITE"
+            echo -e "${GREEN}✅ Site marked as CF-enabled${NC}"
+        fi
+    else
+        echo -e "${RED}❌ Config test failed${NC}"
+        echo ""
+        echo "The backup is at: ${CONFIG_FILE}.bak-$(date +%s)"
+    fi
+fi
+
+echo ""
+echo -e "${BLUE}────────────────────────────────────────${NC}"
+echo -e "${YELLOW}💡 Tips:${NC}"
+echo "  • Add the directives AFTER server_name"
+echo "  • Add to ALL server blocks (HTTP + HTTPS)"
+echo "  • Keep the BEGIN/END markers intact"
+echo "  • Test with: nginx -t"
+echo "  • Reload with: systemctl reload nginx"
+echo -e "${BLUE}────────────────────────────────────────${NC}"

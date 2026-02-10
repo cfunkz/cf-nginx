@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare NGINX IP Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cf-nginx update
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
