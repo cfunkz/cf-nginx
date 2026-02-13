@@ -5,7 +5,7 @@ Priority: optional
 Architecture: all
 Depends: nginx, curl, jq, systemd
 Recommends: certbot, python3-certbot-nginx, ufw
-Maintainer: CF-NGINX <contact@example.com>
+Maintainer: CF-NGINX david@techwizards.work
 Description: Cloudflare IP auto-updater for NGINX and UFW
  Automatically updates Cloudflare IP ranges in NGINX configs
  and UFW firewall rules daily. Set and forget.
