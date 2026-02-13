@@ -142,21 +142,24 @@ update_all_nginx_sites() {
 
 sync_ufw() {
     command -v ufw &>/dev/null || return 1
-    
-    ufw status numbered 2>/dev/null | grep "Cloudflare" | awk '{print $1}' | sed 's/\[//;s/\]//' | sort -rn | while read -r num; do
-        echo "y" | ufw delete "$num" 2>/dev/null || true
+
+    # delete all old Cloudflare rules safely
+    ufw status numbered 2>/dev/null | grep "Cloudflare" | sed -n 's/^\[\s*\([0-9]\+\)\].*/\1/p' | sort -rn | while read -r num; do
+        yes | ufw delete "$num"
     done
-    
+
+    # add IPv4 rules
     while IFS= read -r ip; do
         ufw allow from "$ip" to any port 80 comment "Cloudflare" 2>/dev/null || true
         ufw allow from "$ip" to any port 443 comment "Cloudflare" 2>/dev/null || true
     done < <(get_ipv4_ranges)
-    
+
+    # add IPv6 rules
     while IFS= read -r ip; do
         ufw allow from "$ip" to any port 80 comment "Cloudflare" 2>/dev/null || true
         ufw allow from "$ip" to any port 443 comment "Cloudflare" 2>/dev/null || true
     done < <(get_ipv6_ranges)
-    
+
     return 0
 }
 
