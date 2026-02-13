@@ -139,7 +139,3 @@ sudo dpkg -i cf-nginx.deb
 - systemd
 - certbot (optional, for SSL)
 - ufw (optional, for firewall)
-
-## License
-
-MIT
