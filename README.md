@@ -17,6 +17,7 @@ sudo cf-nginx
 
 # Or single command
 sudo cf-nginx enable yoursite.com
+sudo cf-nginx disable yoursite.com
 ```
 
 ## Features
@@ -56,6 +57,9 @@ Works with both HTTP and HTTPS - updates all server blocks.
 ```bash
 # Check auto-update status
 systemctl status cf-nginx.timer
+
+# Optionally enable UFW update (RECOMMENDED)
+sudo cf-nginx ufw-enable
 
 # Force update now
 sudo cf-nginx update
@@ -126,15 +130,6 @@ nano usr/bin/cf-nginx
 cd ..
 dpkg-deb --build cf-nginx
 sudo dpkg -i cf-nginx.deb
-```
-
-## Configuration
-
-Edit `/etc/cf-nginx/config`:
-
-```bash
-AUTO_UPDATE_NGINX=yes    # Auto-update NGINX configs
-AUTO_UPDATE_UFW=no       # Auto-update UFW (or use ufw-enable command)
 ```
 
 ## Requirements
