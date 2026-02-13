@@ -56,6 +56,7 @@ sudo cf-nginx disable site.com      # Disable CF IPs
 sudo cf-nginx-validate site.com     # Check config
 sudo cf-nginx status                # Show enabled sites
 sudo cf-nginx list                  # Show CF IP ranges
+sudo cf-nginx ufw                   # Sync CF IPs to UFW firewall
 ```
 
 ## Troubleshooting

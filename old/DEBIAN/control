@@ -10,11 +10,11 @@ Description: Cloudflare IP manager for NGINX
  Automatically fetches and updates Cloudflare IP ranges in NGINX
  configurations with daily auto-updates and SSL integration.
  .
- One command: cf-nginx enable <site>
+ One command to enable: cf-nginx enable <site>
  - Detects if SSL is present
  - Offers to install SSL if missing  
  - Adds CF IPs to all server blocks
  - Tests config before applying
  - Auto-rollback on failure
  .
- Commands: cf-nginx, cf-nginx-validate
+ Commands: cf-nginx, cf-nginx-manual, cf-nginx-validate

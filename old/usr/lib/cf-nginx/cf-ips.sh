@@ -94,81 +94,8 @@ remove_cf_directives() {
     sed -i '/# BEGIN CLOUDFLARE IPS - DO NOT EDIT MANUALLY/,/# END CLOUDFLARE IPS/d' "$config_file"
 }
 
-# Sync Cloudflare IPs to UFW
-sync_ufw() {
-    echo -e "${BLUE}Syncing Cloudflare IPs to UFW...${NC}"
-    echo ""
-    
-    if ! command -v ufw &> /dev/null; then
-        echo -e "${RED}❌ UFW not installed${NC}"
-        echo "Install with: apt-get install ufw"
-        return 1
-    fi
-    
-    # Fetch latest IPs
-    fetch_cf_ips
-    
-    echo -e "${YELLOW}Adding Cloudflare IPv4 ranges to UFW...${NC}"
-    local ipv4_count=0
-    while IFS= read -r ip; do
-        ufw allow from "$ip" to any port 80 comment "Cloudflare" 2>/dev/null
-        ufw allow from "$ip" to any port 443 comment "Cloudflare" 2>/dev/null
-        ((ipv4_count++))
-    done < <(get_ipv4_ranges)
-    echo -e "${GREEN}✅ Added $ipv4_count IPv4 ranges${NC}"
-    
-    echo ""
-    echo -e "${YELLOW}Adding Cloudflare IPv6 ranges to UFW...${NC}"
-    local ipv6_count=0
-    while IFS= read -r ip; do
-        ufw allow from "$ip" to any port 80 comment "Cloudflare" 2>/dev/null
-        ufw allow from "$ip" to any port 443 comment "Cloudflare" 2>/dev/null
-        ((ipv6_count++))
-    done < <(get_ipv6_ranges)
-    echo -e "${GREEN}✅ Added $ipv6_count IPv6 ranges${NC}"
-    
-    echo ""
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}✅ Cloudflare IPs synced to UFW${NC}"
-    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    echo -e "${YELLOW}⚠️  IMPORTANT NEXT STEPS:${NC}"
-    echo ""
-    echo "1. Make sure you have SSH access allowed:"
-    echo -e "   ${BLUE}ufw allow 22/tcp${NC}"
-    echo ""
-    echo "2. Enable UFW if not already enabled:"
-    echo -e "   ${BLUE}ufw enable${NC}"
-    echo ""
-    echo "3. ONLY after confirming SSH works, block other incoming:"
-    echo -e "   ${BLUE}ufw default deny incoming${NC}"
-    echo -e "   ${BLUE}ufw default allow outgoing${NC}"
-    echo ""
-    echo -e "${RED}⚠️  WARNING: Don't block SSH or you'll be locked out!${NC}"
-    echo ""
-    echo "View rules:"
-    echo -e "   ${BLUE}ufw status numbered${NC}"
-    echo ""
-}
-
-# Remove Cloudflare IPs from UFW
-remove_ufw_rules() {
-    echo -e "${YELLOW}Removing Cloudflare rules from UFW...${NC}"
-    
-    if ! command -v ufw &> /dev/null; then
-        echo -e "${RED}❌ UFW not installed${NC}"
-        return 1
-    fi
-    
-    # Get all Cloudflare rules and delete them
-    ufw status numbered | grep "Cloudflare" | awk '{print $1}' | sed 's/\[//;s/\]//' | sort -rn | while read -r num; do
-        echo "Deleting rule $num"
-        echo "y" | ufw delete "$num" 2>/dev/null
-    done
-    
-    echo -e "${GREEN}✅ Cloudflare rules removed${NC}"
-}
-
+# Update all enabled sites
+update_all_sites() {
     fetch_cf_ips
     
     echo "Updating all enabled sites with latest CF IPs..."

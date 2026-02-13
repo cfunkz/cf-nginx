@@ -306,8 +306,7 @@ show_menu() {
     echo "  4) Show status"
     echo "  5) Check for CF IP updates"
     echo "  6) List CF IPs"
-    echo "  7) Sync UFW firewall"
-    echo "  8) Exit"
+    echo "  7) Exit"
     echo ""
     echo -n "Choose an option: "
 }
@@ -478,10 +477,6 @@ main() {
             list_cf_ips
             exit 0
             ;;
-        ufw)
-            sync_ufw
-            exit 0
-            ;;
         help|--help|-h)
             echo "Usage: cf-nginx [command] [options]"
             echo ""
@@ -491,7 +486,6 @@ main() {
             echo "  enable <site>       Enable CF support for a site"
             echo "  disable <site>      Disable CF support for a site"
             echo "  list                List all CF IP ranges"
-            echo "  ufw                 Sync Cloudflare IPs to UFW firewall"
             echo "  help                Show this help"
             echo ""
             echo "Interactive mode: Run without arguments"
@@ -524,9 +518,6 @@ main() {
                 list_cf_ips
                 ;;
             7)
-                sync_ufw
-                ;;
-            8)
                 echo -e "${GREEN}Goodbye!${NC}"
                 exit 0
                 ;;
