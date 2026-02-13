@@ -169,6 +169,8 @@ remove_ufw_rules() {
     echo -e "${GREEN}✅ Cloudflare rules removed${NC}"
 }
 
+# Update all enabled sites
+update_all_sites() {
     fetch_cf_ips
     
     echo "Updating all enabled sites with latest CF IPs..."

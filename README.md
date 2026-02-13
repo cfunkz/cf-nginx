@@ -5,8 +5,7 @@ Manage Cloudflare IP ranges in NGINX. One command, works with SSL.
 ## Install
 
 ```bash
-git clone https://github.com/cfunkz/cf-nginx.git
-cd cf-nginx
+wget https://github.com/cfunkz/cf-nginx/releases/download/v1.0.1/cf-nginx.deb
 sudo dpkg -i cf-nginx.deb
 ```
 
