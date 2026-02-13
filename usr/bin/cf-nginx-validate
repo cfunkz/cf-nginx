@@ -1,138 +1,46 @@
 #!/bin/bash
-# Cloudflare IP Configuration Validator
-
+set -e
 source /usr/lib/cf-nginx/cf-ips.sh
 
-# Colors
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}❌ This script must be run as root${NC}"
-    exit 1
-fi
-
-if [[ -z "$1" ]]; then
-    echo "Usage: $0 <site-name>"
-    echo ""
-    echo "Validates Cloudflare IP configuration for a site"
-    exit 1
-fi
+[[ $EUID -ne 0 ]] && echo -e "${RED}❌ Must run as root${NC}" && exit 1
+[[ -z "$1" ]] && echo "Usage: cf-nginx-validate <site>" && exit 1
 
 SITE="$1"
-CONFIG_FILE="/etc/nginx/sites-available/$SITE"
+CONFIG="/etc/nginx/sites-available/$SITE"
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-    echo -e "${RED}❌ Config not found: $CONFIG_FILE${NC}"
-    exit 1
-fi
+[[ ! -f "$CONFIG" ]] && echo -e "${RED}❌ Config not found${NC}" && exit 1
 
-echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║  CF IP Configuration Validator        ║${NC}"
-echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
-echo ""
-echo -e "${YELLOW}Checking: $SITE${NC}"
+echo -e "${BLUE}Validating: $SITE${NC}"
 echo ""
 
-# Check 1: Server blocks
-server_block_count=$(grep -c "^server {" "$CONFIG_FILE" || echo "0")
-echo -e "${BLUE}[1] Server Blocks:${NC} $server_block_count"
+server_count=$(grep -c "^server {" "$CONFIG" 2>/dev/null || echo "0")
+cf_count=$(grep -c "BEGIN CLOUDFLARE IPS" "$CONFIG" 2>/dev/null || echo "0")
 
-# Check 2: CF directive blocks
-cf_block_count=$(grep -c "BEGIN CLOUDFLARE IPS" "$CONFIG_FILE" || echo "0")
-echo -e "${BLUE}[2] CF Directive Blocks:${NC} $cf_block_count"
+echo "Server blocks: $server_count"
+echo "CF blocks: $cf_count"
 
-# Check 3: Match?
-if [[ $server_block_count -eq $cf_block_count && $cf_block_count -gt 0 ]]; then
+if [[ $server_count -eq $cf_count ]] && [[ $cf_count -gt 0 ]]; then
     echo -e "${GREEN}✅ All server blocks have CF directives${NC}"
-elif [[ $cf_block_count -eq 0 ]]; then
-    echo -e "${YELLOW}⚠️  No CF directives found${NC}"
+elif [[ $cf_count -eq 0 ]]; then
+    echo -e "${YELLOW}⚠️  No CF directives${NC}"
 else
-    echo -e "${RED}⚠️  Mismatch: $server_block_count blocks, $cf_block_count CF sections${NC}"
+    echo -e "${RED}⚠️  Mismatch${NC}"
 fi
 
-echo ""
-
-# Check 4: Markers intact
-begin_count=$(grep -c "BEGIN CLOUDFLARE IPS" "$CONFIG_FILE" || echo "0")
-end_count=$(grep -c "END CLOUDFLARE IPS" "$CONFIG_FILE" || echo "0")
-
-if [[ $begin_count -eq $end_count && $begin_count -gt 0 ]]; then
-    echo -e "${GREEN}✅ All CF markers are paired${NC}"
-elif [[ $begin_count -eq 0 ]]; then
-    echo -e "${YELLOW}⚠️  No CF markers found${NC}"
+if nginx -t 2>/dev/null; then
+    echo -e "${GREEN}✅ NGINX config valid${NC}"
 else
-    echo -e "${RED}❌ Marker mismatch: $begin_count BEGIN, $end_count END${NC}"
+    echo -e "${RED}❌ NGINX errors${NC}"
 fi
 
-# Check 5: NGINX syntax
-echo ""
-echo -e "${YELLOW}Testing NGINX configuration...${NC}"
-if nginx -t 2>&1 | grep -q "successful"; then
-    echo -e "${GREEN}✅ NGINX config syntax valid${NC}"
+if is_enabled "$SITE"; then
+    echo -e "${GREEN}✅ Site enabled for auto-updates${NC}"
 else
-    echo -e "${RED}❌ NGINX config has errors${NC}"
-    nginx -t 2>&1 | grep -A 2 "error"
-fi
-
-# Check 6: Show CF block locations
-if [[ $cf_block_count -gt 0 ]]; then
-    echo ""
-    echo -e "${YELLOW}CF Directive Locations:${NC}"
-    grep -n "BEGIN CLOUDFLARE IPS" "$CONFIG_FILE" | while read -r line; do
-        line_num=$(echo "$line" | cut -d: -f1)
-        echo -e "  Line $line_num"
-    done
-fi
-
-# Check 7: IP count
-if [[ $cf_block_count -gt 0 ]]; then
-    echo ""
-    ipv4_in_config=$(grep -c "set_real_ip_from.*\." "$CONFIG_FILE" || echo "0")
-    ipv4_in_config=$((ipv4_in_config / cf_block_count))  # Per block
-    ipv6_in_config=$(grep -c "set_real_ip_from.*:" "$CONFIG_FILE" || echo "0")
-    ipv6_in_config=$((ipv6_in_config / cf_block_count))  # Per block
-    
-    ipv4_expected=$(get_ipv4_ranges | wc -l)
-    ipv6_expected=$(get_ipv6_ranges | wc -l)
-    
-    echo -e "${BLUE}[Per Block] IPv4 IPs:${NC} $ipv4_in_config / $ipv4_expected expected"
-    echo -e "${BLUE}[Per Block] IPv6 IPs:${NC} $ipv6_in_config / $ipv6_expected expected"
-    
-    if [[ $ipv4_in_config -eq $ipv4_expected && $ipv6_in_config -eq $ipv6_expected ]]; then
-        echo -e "${GREEN}✅ IP counts match${NC}"
-    else
-        echo -e "${YELLOW}⚠️  IP count mismatch - may need update${NC}"
-    fi
-fi
-
-# Check 8: Enabled status
-echo ""
-if is_cf_enabled "$SITE"; then
-    echo -e "${GREEN}✅ Site is in enabled list${NC}"
-else
-    echo -e "${YELLOW}⚠️  Site not in enabled list${NC}"
-    echo "    Run: cf-nginx enable $SITE"
-fi
-
-echo ""
-echo -e "${BLUE}════════════════════════════════════════${NC}"
-
-# Summary
-echo ""
-if [[ $cf_block_count -gt 0 && $begin_count -eq $end_count && $server_block_count -eq $cf_block_count ]]; then
-    echo -e "${GREEN}✅ Configuration looks good!${NC}"
-else
-    echo -e "${YELLOW}⚠️  Configuration may need attention${NC}"
-    echo ""
-    echo -e "${YELLOW}Suggested actions:${NC}"
-    if [[ $cf_block_count -eq 0 ]]; then
-        echo "  • Run: cf-nginx enable $SITE"
-    elif [[ $server_block_count -ne $cf_block_count ]]; then
-        echo "  • Re-enable: cf-nginx disable $SITE && cf-nginx enable $SITE"
-        echo "  • Or use: cf-nginx-manual $SITE"
-    fi
+    echo -e "${YELLOW}⚠️  Not enabled${NC}"
 fi

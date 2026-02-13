@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily Cloudflare IP Update Check
+Description=Cloudflare IP Daily Update
 Requires=cf-nginx.service
 
 [Timer]

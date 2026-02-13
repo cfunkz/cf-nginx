@@ -1,13 +1,10 @@
 [Unit]
-Description=Cloudflare NGINX IP Updater
-After=network-online.target
-Wants=network-online.target
+Description=Cloudflare IP Auto-Update
+After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/cf-nginx update
-StandardOutput=journal
-StandardError=journal
+ExecStart=/bin/bash -c 'source /usr/lib/cf-nginx/cf-ips.sh && auto_update'
 
 [Install]
 WantedBy=multi-user.target

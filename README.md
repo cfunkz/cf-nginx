@@ -1,6 +1,6 @@
 # cf-nginx
 
-Manage Cloudflare IP ranges in NGINX. One command, works with SSL.
+Manage Cloudflare IP ranges in NGINX with automatic daily updates.
 
 ## Install
 
@@ -9,68 +9,115 @@ wget https://github.com/cfunkz/cf-nginx/releases/download/v1.0.1/cf-nginx.deb
 sudo dpkg -i cf-nginx.deb
 ```
 
-## Usage
+## Quick Start
 
-For interactive prompts:
 ```bash
+# Interactive menu
 sudo cf-nginx
-```
 
-For single command:
-```bash
+# Or single command
 sudo cf-nginx enable yoursite.com
 ```
 
-Asks if you want SSL (y/n), adds Cloudflare IPs, tests config, reloads NGINX.
+## Features
 
-## What it does
+- **Auto-updates NGINX daily** - Fetches latest CF IPs at 3am  
+- **Auto-updates UFW (optional)** - Sync firewall rules automatically  
+- **SSL detection** - Prompts for Let's Encrypt if needed  
+- **Safe rollback** - Auto-restore on config errors  
+- **Per-site control** - Enable/disable individually
 
-Adds Cloudflare IP directives to your NGINX config:
+## What It Adds
 
 ```nginx
-# BEGIN CLOUDFLARE IPS - DO NOT EDIT MANUALLY
-set_real_ip_from 103.21.244.0/22;
-# ... all Cloudflare IPv4 and IPv6 ranges
-real_ip_header CF-Connecting-IP;
-real_ip_recursive on;
-# END CLOUDFLARE IPS
+server {
+    server_name example.com;
+
+    # BEGIN CLOUDFLARE IPS - DO NOT EDIT MANUALLY
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    # ... all Cloudflare IPv4 and IPv6 ranges
+    
+    real_ip_header CF-Connecting-IP;
+    real_ip_recursive on;
+    # END CLOUDFLARE IPS
+
+    # Your config...
+}
 ```
 
-Works with HTTP and HTTPS. Updates all server blocks.
+Works with both HTTP and HTTPS - updates all server blocks.
 
-## Auto-updates
+## Auto-Updates
 
-Checks Cloudflare's API daily at 3am and updates configs automatically.
+**NGINX configs** - Enabled by default, runs daily at 3am  
+**UFW firewall** - Optional, enable with: `sudo cf-nginx ufw-enable`
 
 ```bash
-systemctl status cf-nginx.timer     # Check status
-sudo cf-nginx update                # Force update now
+# Check auto-update status
+systemctl status cf-nginx.timer
+
+# Force update now
+sudo cf-nginx update
+
+# View logs
+journalctl -u cf-nginx -n 50
 ```
 
 ## Commands
 
 ```bash
+# Site management
 sudo cf-nginx enable site.com       # Enable CF IPs
 sudo cf-nginx disable site.com      # Disable CF IPs
-sudo cf-nginx-validate site.com     # Check config
 sudo cf-nginx status                # Show enabled sites
+
+# Updates
+sudo cf-nginx update                # Update all (NGINX + UFW if enabled)
+
+# UFW firewall
+sudo cf-nginx ufw-enable            # Enable UFW auto-update
+sudo cf-nginx ufw-disable           # Disable UFW auto-update
+
+# Information
 sudo cf-nginx list                  # Show CF IP ranges
-sudo cf-nginx ufw                   # Sync CF IPs to UFW firewall
+sudo cf-nginx-validate site.com     # Validate config
+```
+
+## UFW Firewall
+
+Enable automatic UFW updates:
+
+```bash
+sudo cf-nginx ufw-enable
+```
+
+Now Cloudflare IPs in UFW update automatically with NGINX daily.
+
+**After enabling:**
+```bash
+sudo ufw allow 22/tcp              # Allow SSH first!
+sudo ufw enable
+sudo ufw default deny incoming
 ```
 
 ## Troubleshooting
 
-Check what went wrong:
-
 ```bash
-sudo nginx -t                       # Test config
-sudo cf-nginx-validate site.com     # Validate setup
-journalctl -u cf-nginx -n 50        # View logs
+# Test NGINX config
+sudo nginx -t
+
+# Validate CF setup
+sudo cf-nginx-validate site.com
+
+# Check logs
+journalctl -u cf-nginx -n 50
+
+# View backups
+ls /etc/nginx/sites-available/*.bak-*
 ```
 
-Backups: `/etc/nginx/sites-available/*.bak-*`
-
-## Build from source
+## Build from Source
 
 ```bash
 tar -xzf cf-nginx-source.tar.gz
@@ -81,12 +128,22 @@ dpkg-deb --build cf-nginx
 sudo dpkg -i cf-nginx.deb
 ```
 
+## Configuration
+
+Edit `/etc/cf-nginx/config`:
+
+```bash
+AUTO_UPDATE_NGINX=yes    # Auto-update NGINX configs
+AUTO_UPDATE_UFW=no       # Auto-update UFW (or use ufw-enable command)
+```
+
 ## Requirements
 
 - NGINX
 - curl, jq
 - systemd
 - certbot (optional, for SSL)
+- ufw (optional, for firewall)
 
 ## License
 

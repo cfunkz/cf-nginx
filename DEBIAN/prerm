@@ -1,8 +1,4 @@
 #!/bin/bash
-set -e
-
-# Stop and disable the timer
-systemctl stop cf-nginx.timer || true
-systemctl disable cf-nginx.timer || true
-
+systemctl stop cf-nginx.timer 2>/dev/null || true
+systemctl disable cf-nginx.timer 2>/dev/null || true
 exit 0

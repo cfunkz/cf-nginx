@@ -1,16 +1,9 @@
 #!/bin/bash
-set -e
-
-# Enable and start the timer
+mkdir -p /var/lib/cf-nginx
+touch /var/lib/cf-nginx/enabled_sites
 systemctl daemon-reload
 systemctl enable cf-nginx.timer
 systemctl start cf-nginx.timer
-
-# Create cache directory
-mkdir -p /var/lib/cf-nginx
-
-echo "✅ Cloudflare NGINX IPs package installed"
-echo "   Run: cf-nginx to configure sites"
-echo "   Auto-update: enabled (daily at 3am)"
-
+/bin/bash -c 'source /usr/lib/cf-nginx/cf-ips.sh && fetch_cf_ips' 2>/dev/null || true
+echo "✅ cf-nginx installed - Run 'cf-nginx' to get started"
 exit 0

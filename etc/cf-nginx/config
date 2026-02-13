@@ -1,0 +1,5 @@
+# cf-nginx configuration
+AUTO_UPDATE_NGINX=yes
+AUTO_UPDATE_UFW=no
+CF_API_URL=https://api.cloudflare.com/client/v4/ips
+DATA_DIR=/var/lib/cf-nginx
