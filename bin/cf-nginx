@@ -1,0 +1,1271 @@
+#!/usr/bin/env bash
+# cf-nginx - Cloudflare toolkit for an existing nginx install (Debian/Ubuntu).
+#
+# Keeps Cloudflare's published IP ranges in a set of generated nginx include
+# snippets (real visitor IP, trusted CF-* headers, origin lockdown,
+# Authenticated Origin Pulls) and refreshes them daily. Site configs are only
+# touched when you ask (`cf-nginx enable`), and then only by adding or removing
+# single, marked `include` lines.
+#
+# https://github.com/cfunkz/cf-nginx            License: Apache-2.0
+
+# shellcheck disable=SC2016,SC2015  # literal nginx $variables; intentional A && B || C
+set -Eeuo pipefail
+shopt -s nullglob
+umask 022
+export LC_ALL=C
+
+readonly VERSION="0.0.1"
+readonly PROG="cf-nginx"
+readonly MARK="# managed-by: cf-nginx"
+
+CONFIG_FILE="${CF_NGINX_CONFIG:-/etc/cf-nginx/cf-nginx.conf}"
+STATE_DIR="${CF_NGINX_STATE_DIR:-/var/lib/cf-nginx}"
+LOCK_FILE="${CF_NGINX_LOCK:-/run/lock/cf-nginx.lock}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SHARE_DIR="${CF_NGINX_SHARE:-$(dirname "$(dirname "$SELF")")/share/cf-nginx}"
+
+QUIET=0
+FORCE=0
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RED=$'\e[31m' C_GRN=$'\e[32m' C_YEL=$'\e[33m' C_BLD=$'\e[1m' C_OFF=$'\e[0m'
+else
+    C_RED="" C_GRN="" C_YEL="" C_BLD="" C_OFF=""
+fi
+
+info() { (( QUIET )) || printf '%s\n' "$*"; }
+ok()   { (( QUIET )) || printf '%s✓%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+err()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# Temp files: a per-run directory plus a cleanup list (a file, so paths
+# registered from command-substitution subshells are not lost).
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/cf-nginx.XXXXXX")"
+cleanup() {
+    local p
+    if [[ -f "$TMPD/.cleanup" ]]; then
+        while IFS= read -r p; do [[ -n "$p" ]] && rm -rf -- "$p"; done < "$TMPD/.cleanup"
+    fi
+    rm -rf -- "$TMPD"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+tmpf() { mktemp -p "$TMPD"; }
+
+# Temp path next to a target (same filesystem => atomic rename).
+mktemp_tracked() { # mktemp args...
+    local p
+    p="$(mktemp "$@")"
+    printf '%s\n' "$p" >> "$TMPD/.cleanup"
+    printf '%s' "$p"
+}
+
+# --------------------------------------------------------------------------
+# Configuration (parsed, never sourced: the file is data, not code)
+# --------------------------------------------------------------------------
+IPS_V4_URL="https://www.cloudflare.com/ips-v4"
+IPS_V6_URL="https://www.cloudflare.com/ips-v6"
+ENABLE_IPV6="yes"
+GLOBAL_REAL_IP="no"
+REAL_IP_HEADER="CF-Connecting-IP"
+ORIGIN_LOCK_ALLOW="127.0.0.1 ::1"
+ORIGIN_LOCK_STATUS="403"
+ORIGIN_LOCK_ACME_BYPASS="yes"
+ORIGIN_PULL_CA="no"
+ORIGIN_PULL_CA_URL="https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem"
+UFW_SYNC="no"
+UFW_PORTS="80,443"
+MAX_SHRINK_PERCENT="50"
+NGINX_BIN=""
+NGINX_CONF_DIR=""
+
+readonly CONFIG_KEYS=" IPS_V4_URL IPS_V6_URL ENABLE_IPV6 GLOBAL_REAL_IP REAL_IP_HEADER ORIGIN_LOCK_ALLOW ORIGIN_LOCK_STATUS ORIGIN_LOCK_ACME_BYPASS ORIGIN_PULL_CA ORIGIN_PULL_CA_URL UFW_SYNC UFW_PORTS MAX_SHRINK_PERCENT NGINX_BIN NGINX_CONF_DIR "
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    local line key val n=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        if [[ ! "$line" =~ ^[[:space:]]*([A-Z0-9_]+)=(.*)$ ]]; then
+            warn "$CONFIG_FILE:$n: ignoring malformed line"
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        val="${val%"${val##*[![:space:]]}"}"            # rtrim
+        if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then
+            val="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$CONFIG_KEYS" != *" $key "* ]]; then
+            warn "$CONFIG_FILE:$n: unknown setting $key"
+            continue
+        fi
+        printf -v "$key" '%s' "$val"
+    done < "$CONFIG_FILE"
+}
+
+is_yes() { [[ "${1,,}" =~ ^(yes|y|true|1|on)$ ]]; }
+
+validate_config() {
+    local v
+    for v in ENABLE_IPV6 GLOBAL_REAL_IP ORIGIN_LOCK_ACME_BYPASS ORIGIN_PULL_CA UFW_SYNC; do
+        [[ "${!v,,}" =~ ^(yes|no|y|n|true|false|1|0|on|off)$ ]] || die "config: $v must be yes or no (got '${!v}')"
+    done
+    for v in IPS_V4_URL IPS_V6_URL ORIGIN_PULL_CA_URL; do
+        [[ "${!v}" =~ ^(https|file)://[^[:space:]\"\'\;]+$ ]] || die "config: $v must be an https:// (or file://) URL"
+    done
+    [[ "$REAL_IP_HEADER" =~ ^[A-Za-z0-9-]{1,64}$ ]] || die "config: REAL_IP_HEADER is not a valid header name"
+    [[ "$ORIGIN_LOCK_STATUS" =~ ^(4[0-9][0-9]|444)$ ]] || die "config: ORIGIN_LOCK_STATUS must be a 4xx code (e.g. 403 or 444)"
+    [[ "$UFW_PORTS" =~ ^[0-9]{1,5}(,[0-9]{1,5})*$ ]] || die "config: UFW_PORTS must look like 80,443"
+    [[ "$MAX_SHRINK_PERCENT" =~ ^[0-9]{1,3}$ ]] && (( MAX_SHRINK_PERCENT <= 100 )) || die "config: MAX_SHRINK_PERCENT must be 0-100"
+    local a
+    for a in $ORIGIN_LOCK_ALLOW; do
+        valid_v4_cidr "$a" 0 || valid_v6_cidr "$a" 0 || valid_v4_addr "$a" || valid_v6_addr "$a" \
+            || die "config: ORIGIN_LOCK_ALLOW entry '$a' is not an IP or CIDR"
+    done
+}
+
+# Rewrite one KEY=value line in the config atomically (append if missing).
+set_config() {
+    local key="$1" val="$2" tmp
+    [[ "$CONFIG_KEYS" == *" $key "* ]] || die "internal: unknown key $key"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    [[ -f "$CONFIG_FILE" ]] || : > "$CONFIG_FILE"
+    tmp="$(mktemp_tracked "$CONFIG_FILE.XXXXXX")"
+    awk -v k="$key" -v v="$val" '
+        BEGIN { done = 0 }
+        $0 ~ "^[[:space:]]*" k "=" { if (!done) print k "=" v; done = 1; next }
+        { print }
+        END { if (!done) print k "=" v }
+    ' "$CONFIG_FILE" > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+    printf -v "$key" '%s' "$val"
+}
+
+# --------------------------------------------------------------------------
+# IP / CIDR validation (strict; anything unexpected is rejected)
+# --------------------------------------------------------------------------
+valid_v4_addr() {
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o
+    local -a oct=("${BASH_REMATCH[@]:1:4}")
+    for o in "${oct[@]}"; do
+        [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( o <= 255 )) || return 1
+    done
+}
+
+valid_v4_cidr() { # cidr [min_prefix]
+    local min="${2:-8}" addr pfx
+    [[ "$1" == */* ]] || return 1
+    addr="${1%/*}" pfx="${1##*/}"
+    valid_v4_addr "$addr" || return 1
+    [[ "$pfx" =~ ^(0|[1-9][0-9]?)$ ]] && (( pfx >= min && pfx <= 32 ))
+}
+
+valid_v6_addr() {
+    local a="$1" tmp marks left right g n=0
+    [[ "$a" =~ ^[0-9A-Fa-f:]{2,39}$ ]] || return 1
+    [[ "$a" == *:::* ]] && return 1
+    tmp="${a//::/#}"; marks="${tmp//[^#]/}"
+    (( ${#marks} <= 1 )) || return 1
+    if (( ${#marks} == 1 )); then
+        left="${a%%::*}" right="${a#*::}"
+        for g in ${left//:/ } ${right//:/ }; do
+            [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+            n=$((n + 1))
+        done
+        # empty groups between single colons would have been skipped by word
+        # splitting; reject them explicitly.
+        [[ "$left" == :* || "$left" == *: || "$right" == :* || "$right" == *: || "$left$right" == *::* ]] && return 1
+        (( n <= 7 ))
+    else
+        [[ "$a" == :* || "$a" == *: ]] && return 1
+        local IFS=:
+        # shellcheck disable=SC2206
+        local parts=($a)
+        (( ${#parts[@]} == 8 )) || return 1
+        for g in "${parts[@]}"; do [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1; done
+    fi
+}
+
+valid_v6_cidr() { # cidr [min_prefix]
+    local min="${2:-16}" addr pfx
+    [[ "$1" == */* ]] || return 1
+    addr="${1%/*}" pfx="${1##*/}"
+    valid_v6_addr "$addr" || return 1
+    [[ "$pfx" =~ ^(0|[1-9][0-9]{0,2})$ ]] && (( pfx >= min && pfx <= 128 ))
+}
+
+# Validate a downloaded list. Prints normalised, sorted, unique CIDRs.
+# family: 4|6
+validate_list() {
+    local family="$1" file="$2" line count=0 min max
+    local -a out=()
+    if [[ "$family" == 4 ]]; then min=3 max=500; else min=2 max=500; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        if [[ "$family" == 4 ]]; then
+            valid_v4_cidr "$line" 8 || { err "rejecting IPv4 list: invalid entry '${line:0:60}'"; return 1; }
+        else
+            valid_v6_cidr "$line" 16 || { err "rejecting IPv6 list: invalid entry '${line:0:60}'"; return 1; }
+            line="${line,,}"
+        fi
+        out+=("$line")
+        count=$((count + 1))
+    done < "$file"
+    if (( count < min || count > max )); then
+        err "rejecting IPv$family list: $count entries is outside the sane range $min-$max"
+        return 1
+    fi
+    printf '%s\n' "${out[@]}" | sort -u
+}
+
+# --------------------------------------------------------------------------
+# nginx detection
+# --------------------------------------------------------------------------
+NGINX_V=""
+REALIP_MODULE=0
+
+detect_nginx() {
+    if [[ -z "$NGINX_BIN" ]]; then
+        NGINX_BIN="$(command -v nginx 2>/dev/null || true)"
+        [[ -z "$NGINX_BIN" && -x /usr/sbin/nginx ]] && NGINX_BIN=/usr/sbin/nginx
+    fi
+    [[ -n "$NGINX_BIN" && -x "$NGINX_BIN" ]] \
+        || die "nginx was not found. Install it first (e.g. 'apt install nginx') or set NGINX_BIN in $CONFIG_FILE."
+    NGINX_V="$("$NGINX_BIN" -V 2>&1 || true)"
+    if [[ -z "$NGINX_CONF_DIR" ]]; then
+        local conf_path
+        conf_path="$(grep -o -- '--conf-path=[^ ]*' <<<"$NGINX_V" | head -n1 | cut -d= -f2- || true)"
+        NGINX_CONF_DIR="$(dirname "${conf_path:-/etc/nginx/nginx.conf}")"
+    fi
+    [[ -d "$NGINX_CONF_DIR" ]] || die "nginx config directory $NGINX_CONF_DIR does not exist (set NGINX_CONF_DIR)"
+    NGINX_CONF_DIR="$(readlink -f "$NGINX_CONF_DIR")"
+    grep -q -- '--with-http_realip_module' <<<"$NGINX_V" && REALIP_MODULE=1 || REALIP_MODULE=0
+
+    CF_DIR="$NGINX_CONF_DIR/cloudflare"
+    HOOK_FILE="$NGINX_CONF_DIR/conf.d/00-cloudflare.conf"
+}
+
+nginx_test() { # prints nginx -t output on failure
+    local out
+    if out="$("$NGINX_BIN" -t 2>&1)"; then return 0; fi
+    printf '%s\n' "$out" >&2
+    return 1
+}
+
+# Files nginx actually loads (from `nginx -T`), one realpath per line.
+nginx_loaded_files() {
+    "$NGINX_BIN" -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p' \
+        | while IFS= read -r f; do readlink -f "$f" || true; done | sort -u
+}
+
+nginx_reload() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] \
+        && systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl reload nginx
+    elif pgrep -x nginx >/dev/null 2>&1; then
+        "$NGINX_BIN" -s reload
+    else
+        info "nginx is not running; new config will be used when it starts"
+        return 0
+    fi
+    ok "nginx reloaded"
+}
+
+require_root() { [[ $EUID -eq 0 ]] || die "this command must be run as root (try: sudo $PROG $*)"; }
+
+take_lock() {
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -w 120 9 || die "another cf-nginx run is in progress"
+}
+
+preflight() { # for any command that mutates nginx config
+    require_root "$@"
+    detect_nginx
+    take_lock
+    mkdir -p "$STATE_DIR/backups"
+    chmod 0750 "$STATE_DIR"
+    if ! nginx_test; then
+        die "nginx config is already invalid (see above); fix it before running cf-nginx"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Fetching
+# --------------------------------------------------------------------------
+fetch_url() { # url dest
+    curl --silent --show-error --fail --location \
+        --proto '=https,file' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 \
+        --max-filesize 1048576 \
+        --user-agent "cf-nginx/$VERSION" \
+        --output "$2" "$1"
+}
+
+# Fetch + validate one family into $STATE_DIR/ips-v$1.txt. Returns 0 if the
+# cache now holds a validated list (fresh or previous), 1 otherwise.
+refresh_family() {
+    local fam="$1" url="$2" cache="$STATE_DIR/ips-v$1.txt" raw clean old_n new_n
+    raw="$(tmpf)"
+    clean="$(tmpf)"
+    if ! fetch_url "$url" "$raw"; then
+        warn "could not download IPv$fam ranges from $url"
+        return 2
+    fi
+    validate_list "$fam" "$raw" > "$clean" || return 2
+    new_n="$(wc -l < "$clean")"
+    if [[ -s "$cache" ]] && (( ! FORCE )); then
+        old_n="$(wc -l < "$cache")"
+        if (( new_n * 100 < old_n * (100 - MAX_SHRINK_PERCENT) )); then
+            err "IPv$fam list shrank from $old_n to $new_n entries; refusing (use --force if this is expected)"
+            return 2
+        fi
+    fi
+    if [[ -f "$cache" ]] && cmp -s "$clean" "$cache"; then
+        info "IPv$fam: $new_n ranges (unchanged)"
+    else
+        install -m 0644 "$clean" "$cache.tmp" && mv -f "$cache.tmp" "$cache"
+        info "IPv$fam: $new_n ranges (updated)"
+    fi
+    return 0
+}
+
+ensure_list() { # fam -> ensures cache exists, seeding from bundled list if needed
+    local fam="$1" cache="$STATE_DIR/ips-v$1.txt" seed="$SHARE_DIR/ips-v$1.seed" clean
+    [[ -s "$cache" ]] && return 0
+    [[ -f "$seed" ]] || die "no IPv$fam list available (download failed and no bundled seed at $seed)"
+    clean="$(tmpf)"
+    validate_list "$fam" "$seed" > "$clean" || die "bundled seed list $seed is invalid"
+    install -m 0644 "$clean" "$cache"
+    warn "using bundled IPv$fam seed list; it will be replaced on the next successful download"
+}
+
+refresh_origin_pull_ca() {
+    is_yes "$ORIGIN_PULL_CA" || return 0
+    command -v openssl >/dev/null 2>&1 || { warn "openssl not installed; skipping Authenticated Origin Pulls CA"; return 0; }
+    local raw cache="$STATE_DIR/origin-pull-ca.pem"
+    raw="$(tmpf)"
+    if fetch_url "$ORIGIN_PULL_CA_URL" "$raw" \
+        && grep -q -- '-----BEGIN CERTIFICATE-----' "$raw" \
+        && openssl x509 -in "$raw" -noout -checkend 0 >/dev/null 2>&1; then
+        if ! cmp -s "$raw" "$cache" 2>/dev/null; then
+            install -m 0644 "$raw" "$cache.tmp" && mv -f "$cache.tmp" "$cache"
+            info "Authenticated Origin Pulls CA updated"
+        fi
+    else
+        warn "could not download a valid Authenticated Origin Pulls CA; keeping the previous one"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Rendering
+# --------------------------------------------------------------------------
+cf_ranges() { # all validated CF ranges, v4 then v6
+    cat "$STATE_DIR/ips-v4.txt"
+    if is_yes "$ENABLE_IPV6"; then cat "$STATE_DIR/ips-v6.txt"; fi
+}
+
+header() {
+    printf '# Generated by cf-nginx %s. Do not edit: this file is rewritten on every update.\n' "$VERSION"
+    printf '# Context: %s\n' "$1"
+    printf '# Docs: https://github.com/cfunkz/cf-nginx\n\n'
+}
+
+render_all() { # staging_dir
+    local d="$1" cidr a addr_var
+    if (( REALIP_MODULE )); then addr_var='$realip_remote_addr'; else addr_var='$remote_addr'; fi
+
+    cp "$STATE_DIR/ips-v4.txt" "$d/ips-v4.txt"
+    if is_yes "$ENABLE_IPV6"; then cp "$STATE_DIR/ips-v6.txt" "$d/ips-v6.txt"; else : > "$d/ips-v6.txt"; fi
+
+    # ---- real-ip.conf ---------------------------------------------------
+    {
+        header "http, server or location"
+        if (( REALIP_MODULE )); then
+            echo "# Restores the visitor IP from $REAL_IP_HEADER, trusting it only from Cloudflare."
+            while IFS= read -r cidr; do printf 'set_real_ip_from %s;\n' "$cidr"; done < <(cf_ranges)
+            printf 'real_ip_header %s;\n' "$REAL_IP_HEADER"
+        else
+            echo "# nginx was built without ngx_http_realip_module; real IP restoration is unavailable."
+        fi
+    } > "$d/real-ip.conf"
+
+    # ---- http.conf (variables, maps, log format) --------------------------
+    {
+        header "http (loaded once via $HOOK_FILE)"
+        echo "# \$cf_is_cloudflare: 1 when the TCP peer is a Cloudflare edge server."
+        printf 'geo %s $cf_is_cloudflare {\n    default 0;\n' "$addr_var"
+        while IFS= read -r cidr; do printf '    %s 1;\n' "$cidr"; done < <(cf_ranges)
+        echo "}"
+        echo
+        echo "# \$cf_origin_allowed: Cloudflare plus ORIGIN_LOCK_ALLOW (used by origin-lock.conf)."
+        printf 'geo %s $cf_origin_allowed {\n    default 0;\n' "$addr_var"
+        while IFS= read -r cidr; do printf '    %s 1;\n' "$cidr"; done < <(cf_ranges)
+        for a in $ORIGIN_LOCK_ALLOW; do printf '    %s 1;\n' "$a"; done
+        echo "}"
+        echo
+        cat <<'EOF'
+# Cloudflare request headers, exposed only when the request really came
+# through Cloudflare. Spoofed CF-* headers from anyone else become empty.
+map "$cf_is_cloudflare:$http_cf_connecting_ip" $cf_connecting_ip {
+    default "";
+    "~^1:(?<cfngx_cip>[0-9A-Fa-f:.]{2,45})$" $cfngx_cip;
+}
+map "$cf_is_cloudflare:$http_cf_ipcountry" $cf_country {
+    default "";
+    "~^1:(?<cfngx_cc>[A-Za-z0-9]{2})$" $cfngx_cc;
+}
+map "$cf_is_cloudflare:$http_cf_ray" $cf_ray {
+    default "";
+    "~^1:(?<cfngx_ray>[A-Za-z0-9-]{1,64})$" $cfngx_ray;
+}
+map "$cf_is_cloudflare:$http_cf_visitor" $cf_visitor {
+    default "";
+    "~^1:(?<cfngx_vis>\{[^\r\n]{1,128}\})$" $cfngx_vis;
+}
+
+# Scheme the visitor used to reach Cloudflare (falls back to $scheme).
+map "$cf_is_cloudflare:$http_cf_visitor" $cf_scheme {
+    default $scheme;
+    '~^1:.*"scheme":"https"' https;
+    '~^1:.*"scheme":"http"'  http;
+}
+map $cf_scheme $cf_https {
+    default "";
+    https   on;
+}
+
+EOF
+        echo "# 1 = request must be rejected by origin-lock.conf."
+        echo 'map "$cf_origin_allowed:$uri" $cf_origin_deny {'
+        echo '    default 1;'
+        echo '    "~^1:" 0;'
+        if is_yes "$ORIGIN_LOCK_ACME_BYPASS"; then
+            echo '    "~^0:/\.well-known/acme-challenge/" 0;'
+        fi
+        echo '}'
+        echo
+        cat <<'EOF'
+# Access log format with Cloudflare context:  access_log /var/log/nginx/access.log cloudflare;
+log_format cloudflare '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+                      'cf_ray=$cf_ray cf_country=$cf_country edge=$realip_remote_addr '
+                      'rt=$request_time';
+EOF
+        if is_yes "$GLOBAL_REAL_IP" && (( REALIP_MODULE )); then
+            echo
+            echo "# GLOBAL_REAL_IP=yes: real visitor IP for every server block."
+            printf 'include %s/real-ip.conf;\n' "$CF_DIR"
+        fi
+    } > "$d/http.conf"
+    if (( ! REALIP_MODULE )); then
+        sed -i 's/edge=\$realip_remote_addr /edge=$remote_addr /' "$d/http.conf"
+    fi
+
+    # ---- origin-lock.conf -------------------------------------------------
+    {
+        header "server or location (requires http.conf)"
+        echo "# Rejects requests that did not come through Cloudflare (or ORIGIN_LOCK_ALLOW)."
+        printf 'if ($cf_origin_deny) {\n    return %s;\n}\n' "$ORIGIN_LOCK_STATUS"
+    } > "$d/origin-lock.conf"
+
+    # ---- proxy-headers.conf -----------------------------------------------
+    {
+        header "location with proxy_pass (requires http.conf)"
+        cat <<'EOF'
+# Note: any proxy_set_header in the same block disables inheritance from outer
+# blocks, so include this next to your other proxy_set_header lines.
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $remote_addr;
+proxy_set_header X-Forwarded-Proto $cf_scheme;
+proxy_set_header X-Forwarded-Host  $host;
+proxy_set_header CF-Connecting-IP  $cf_connecting_ip;
+proxy_set_header CF-IPCountry      $cf_country;
+proxy_set_header CF-Ray            $cf_ray;
+proxy_set_header CF-Visitor        $cf_visitor;
+EOF
+    } > "$d/proxy-headers.conf"
+
+    # ---- fastcgi-params.conf ----------------------------------------------
+    {
+        header "location with fastcgi_pass, after 'include fastcgi_params;' (requires http.conf)"
+        cat <<'EOF'
+fastcgi_param REMOTE_ADDR            $remote_addr;
+fastcgi_param REQUEST_SCHEME         $cf_scheme;
+fastcgi_param HTTPS                  $cf_https if_not_empty;
+fastcgi_param HTTP_X_FORWARDED_PROTO $cf_scheme;
+fastcgi_param HTTP_CF_CONNECTING_IP  $cf_connecting_ip if_not_empty;
+fastcgi_param HTTP_CF_IPCOUNTRY      $cf_country if_not_empty;
+fastcgi_param HTTP_CF_RAY            $cf_ray if_not_empty;
+fastcgi_param HTTP_CF_VISITOR        $cf_visitor if_not_empty;
+EOF
+    } > "$d/fastcgi-params.conf"
+
+    # ---- origin-pull.conf (Authenticated Origin Pulls, mTLS) ---------------
+    if is_yes "$ORIGIN_PULL_CA" && [[ -s "$STATE_DIR/origin-pull-ca.pem" ]]; then
+        cp "$STATE_DIR/origin-pull-ca.pem" "$d/origin-pull-ca.pem"
+        {
+            header "server with 'listen 443 ssl'"
+            echo "# Only accept TLS connections that present Cloudflare's origin-pull client cert."
+            echo "# Enable 'Authenticated Origin Pulls' in the Cloudflare dashboard first."
+            printf 'ssl_client_certificate %s/origin-pull-ca.pem;\n' "$CF_DIR"
+            echo 'ssl_verify_client on;'
+        } > "$d/origin-pull.conf"
+    fi
+    chmod 0644 "$d"/*
+}
+
+render_hook() { # dest
+    {
+        echo "# Generated by cf-nginx. Loads Cloudflare variables into the http {} context."
+        echo "# Remove with: cf-nginx uninstall"
+        printf 'include %s/http.conf;\n' "$CF_DIR"
+    } > "$1"
+    chmod 0644 "$1"
+}
+
+# --------------------------------------------------------------------------
+# Applying generated files: atomic swap, nginx -t, rollback
+# --------------------------------------------------------------------------
+dir_differs() { # a b
+    diff -rq "$1" "$2" >/dev/null 2>&1 && return 1 || return 0
+}
+
+# Decide whether the conf.d hook should exist. If the operator already includes
+# http.conf by hand we must not include it twice.
+want_hook() {
+    [[ -d "$(dirname "$HOOK_FILE")" ]] || return 1
+    [[ -f "$HOOK_FILE" ]] && return 0
+    if [[ -f "$CF_DIR/http.conf" ]] && nginx_loaded_files | grep -qxF "$CF_DIR/http.conf"; then
+        return 1
+    fi
+    return 0
+}
+
+apply_generated() { # -> 0 applied/unchanged, 1 failed+rolled back
+    local stage backup hook_tmp changed=0 hook_new=0 f
+    stage="$(mktemp_tracked -d "$NGINX_CONF_DIR/.cf-nginx-stage.XXXXXX")"
+    render_all "$stage"
+
+    if [[ ! -d "$CF_DIR" ]] || dir_differs "$stage" "$CF_DIR"; then changed=1; fi
+    if want_hook; then
+        hook_tmp="$(mktemp_tracked "$NGINX_CONF_DIR/conf.d/.cf-nginx-hook.XXXXXX")"
+        render_hook "$hook_tmp"
+        cmp -s "$hook_tmp" "$HOOK_FILE" 2>/dev/null || hook_new=1
+    fi
+    if (( ! changed && ! hook_new )); then
+        ok "nginx snippets already up to date"
+        return 0
+    fi
+
+    backup="$STATE_DIR/last-good"
+    rm -rf -- "$backup"
+    mkdir -p "$backup"
+    [[ -d "$CF_DIR" ]] && cp -a "$CF_DIR" "$backup/cloudflare"
+    [[ -f "$HOOK_FILE" ]] && cp -a "$HOOK_FILE" "$backup/hook.conf"
+
+    mkdir -p "$CF_DIR"
+    chmod 0755 "$CF_DIR"
+    # Per-file rename is atomic; nginx only reads these on reload, which we do
+    # after validation.
+    for f in "$stage"/*; do mv -f "$f" "$CF_DIR/$(basename "$f")"; done
+    # Remove generated files that are no longer produced (e.g. origin-pull.conf).
+    for f in "$CF_DIR"/*; do
+        case "$(basename "$f")" in
+            real-ip.conf|http.conf|origin-lock.conf|proxy-headers.conf|fastcgi-params.conf|ips-v4.txt|ips-v6.txt) ;;
+            origin-pull.conf|origin-pull-ca.pem) is_yes "$ORIGIN_PULL_CA" && [[ -s "$STATE_DIR/origin-pull-ca.pem" ]] || rm -f -- "$f" ;;
+        esac
+    done
+    (( hook_new )) && mv -f "$hook_tmp" "$HOOK_FILE"
+
+    if nginx_test; then
+        ok "nginx snippets written to $CF_DIR"
+        nginx_reload
+        return 0
+    fi
+
+    err "nginx -t failed with the new Cloudflare snippets; rolling back"
+    rm -rf -- "$CF_DIR"
+    if [[ -d "$backup/cloudflare" ]]; then cp -a "$backup/cloudflare" "$CF_DIR"; fi
+    if [[ -f "$backup/hook.conf" ]]; then cp -a "$backup/hook.conf" "$HOOK_FILE"; else rm -f -- "$HOOK_FILE"; fi
+    nginx_test || err "nginx config still invalid after rollback; manual attention required"
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# Site files: add/remove marked include lines
+# --------------------------------------------------------------------------
+SITES_DB=""  # set after STATE_DIR known
+
+resolve_site() { # name-or-path -> realpath of an existing regular file
+    local arg="$1" cand=()
+    [[ -n "$arg" ]] || die "missing site name"
+    if [[ "$arg" == */* ]]; then
+        cand=("$arg")
+    else
+        [[ "$arg" =~ ^[A-Za-z0-9._-]+$ && "$arg" != .* ]] || die "invalid site name '$arg'"
+        cand=("$NGINX_CONF_DIR/sites-available/$arg"
+              "$NGINX_CONF_DIR/sites-available/$arg.conf"
+              "$NGINX_CONF_DIR/conf.d/$arg.conf"
+              "$NGINX_CONF_DIR/conf.d/$arg")
+    fi
+    local c
+    for c in "${cand[@]}"; do
+        if [[ -f "$c" ]]; then readlink -f "$c"; return 0; fi
+    done
+    die "site '$arg' not found (looked in sites-available/ and conf.d/; you can also pass a file path)"
+}
+
+# Remove cf-nginx managed lines and legacy v1 blocks from a file -> stdout.
+strip_managed() {
+    awk -v mark="$MARK" '
+        /# BEGIN CLOUDFLARE IPS/ { skip = 1; next }
+        skip && /# END CLOUDFLARE IPS/ { skip = 0; eat = 1; next }
+        skip { next }
+        eat { eat = 0; if ($0 ~ /^[ \t]*$/) next }
+        index($0, mark) { next }
+        { print }
+    ' "$1"
+}
+
+# Insert include lines right after the opening brace of every top-level
+# server block. Reads stdin, writes stdout, prints count to fd 3.
+insert_includes() { # include_lines (newline separated)
+    awk -v inc="$1" -v mark="$MARK" '
+        function clean(s) {          # drop quoted strings and comments
+            gsub(/"([^"\\]|\\.)*"/, "", s); gsub(/\047([^\047\\]|\\.)*\047/, "", s)
+            sub(/#.*/, "", s); return s
+        }
+        function emit(indent,   n, i, parts) {
+            n = split(inc, parts, "\n")
+            for (i = 1; i <= n; i++) if (parts[i] != "") print indent parts[i] " " mark
+            count++
+        }
+        BEGIN { depth = 0; pending = 0; count = 0 }
+        {
+            line = $0; c = clean(line)
+            ind = line; sub(/[^ \t].*/, "", ind)
+            opens = gsub(/\{/, "{", c); closes = gsub(/\}/, "}", c)
+            print line
+            if (pending && c ~ /^[ \t]*\{/) {
+                emit(pind "    "); pending = 0
+            } else if (depth == 0 && c ~ /^[ \t]*server[ \t]*\{[ \t]*$/) {
+                emit(ind "    ")
+            } else if (depth == 0 && c ~ /^[ \t]*server[ \t]*$/) {
+                pending = 1; pind = ind
+            } else if (depth == 0 && c ~ /^[ \t]*server[ \t]*\{/) {
+                skipped++
+            } else if (c !~ /^[ \t]*$/) {
+                pending = 0
+            }
+            depth += opens - closes
+        }
+        END { print count " " skipped+0 > "/dev/fd/3" }
+    '
+}
+
+backup_file() { # path -> copies into STATE_DIR/backups, keeps last 10 per file
+    local src="$1" key dest
+    key="$(printf '%s' "$src" | tr '/' '_' | tr -cd 'A-Za-z0-9._-')"
+    dest="$STATE_DIR/backups/$key.$(date +%Y%m%d-%H%M%S).$$"
+    cp -p -- "$src" "$dest"
+    # shellcheck disable=SC2012
+    ls -1t "$STATE_DIR/backups/$key".* 2>/dev/null | tail -n +11 | xargs -r rm -f --
+    printf '%s' "$dest"
+}
+
+replace_file() { # new_content_file target -> atomic replace keeping owner/mode
+    local new="$1" target="$2" tmp
+    tmp="$(mktemp_tracked "$(dirname "$target")/.cf-nginx.XXXXXX")"
+    cat -- "$new" > "$tmp"
+    chmod --reference="$target" "$tmp"
+    chown --reference="$target" "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$target"
+}
+
+sites_db_add() { # path flags
+    local tmp
+    tmp="$(mktemp_tracked "$SITES_DB.XXXXXX")"
+    { [[ -f "$SITES_DB" ]] && awk -v p="$1" -F'\t' '$1 != p' "$SITES_DB"; printf '%s\t%s\n' "$1" "$2"; } > "$tmp"
+    mv -f "$tmp" "$SITES_DB"
+}
+sites_db_del() {
+    [[ -f "$SITES_DB" ]] || return 0
+    local tmp
+    tmp="$(mktemp_tracked "$SITES_DB.XXXXXX")"
+    awk -v p="$1" -F'\t' '$1 != p' "$SITES_DB" > "$tmp"
+    mv -f "$tmp" "$SITES_DB"
+}
+
+http_layer_loaded() {
+    nginx_loaded_files | grep -qxF "$CF_DIR/http.conf"
+}
+
+cmd_enable() {
+    local site="" lock=0 realip=1 aop=0 a
+    for a in "$@"; do
+        case "$a" in
+            --lock) lock=1 ;;
+            --no-real-ip) realip=0 ;;
+            --origin-pull) aop=1 ;;
+            -*) die "unknown option $a" ;;
+            *) [[ -z "$site" ]] || die "only one site at a time"; site="$a" ;;
+        esac
+    done
+    preflight enable "$@"
+    [[ -f "$CF_DIR/http.conf" ]] || die "snippets not generated yet; run '$PROG setup' first"
+    local file; file="$(resolve_site "$site")"
+
+    local inc="" flags=""
+    if (( realip )); then
+        (( REALIP_MODULE )) || die "this nginx has no realip module; use --no-real-ip"
+        if is_yes "$GLOBAL_REAL_IP"; then
+            info "GLOBAL_REAL_IP=yes already restores visitor IPs everywhere; not adding real-ip.conf"
+        else
+            inc+="include $CF_DIR/real-ip.conf;"$'\n'; flags+="real-ip,"
+        fi
+    fi
+    if (( lock )); then
+        http_layer_loaded || die "$CF_DIR/http.conf is not loaded by nginx; add 'include $CF_DIR/http.conf;' inside http {} (see '$PROG status')"
+        inc+="include $CF_DIR/origin-lock.conf;"$'\n'; flags+="lock,"
+    fi
+    if (( aop )); then
+        [[ -f "$CF_DIR/origin-pull.conf" ]] || die "origin-pull.conf missing; run '$PROG origin-pull on' first"
+        inc+="include $CF_DIR/origin-pull.conf;"$'\n'; flags+="origin-pull,"
+    fi
+    [[ -n "$inc" ]] || die "nothing to enable"
+
+    local stripped out res count skipped bak
+    stripped="$(tmpf)"; out="$(tmpf)"; res="$(tmpf)"
+    strip_managed "$file" > "$stripped"
+    insert_includes "$inc" < "$stripped" > "$out" 3> "$res"
+    read -r count skipped < "$res"
+    (( skipped == 0 )) || warn "$skipped single-line server block(s) in $file were skipped; add the include by hand"
+    (( count > 0 )) || die "no top-level 'server {' block found in $file"
+    if cmp -s "$out" "$file"; then
+        sites_db_add "$file" "${flags%,}"
+        ok "$file already configured (${flags%,})"
+        return 0
+    fi
+
+    bak="$(backup_file "$file")"
+    replace_file "$out" "$file"
+    if ! nginx_test; then
+        replace_file "$bak" "$file"
+        die "nginx -t failed after editing $file; original restored (backup: $bak)"
+    fi
+    sites_db_add "$file" "${flags%,}"
+    ok "enabled ${flags%,} in $count server block(s) of $file"
+    nginx_loaded_files | grep -qxF "$file" || warn "$file is not currently loaded by nginx (is it linked in sites-enabled?)"
+    nginx_reload
+    if (( aop )) && grep -q 'ssl_verify_client' "$out" && ! grep -q 'listen[^;]*ssl' "$out"; then
+        warn "origin-pull.conf only has an effect on 'listen ... ssl' servers"
+    fi
+}
+
+disable_file() { # path -> 0 ok, 1 failed
+    local file="$1" out bak
+    [[ -f "$file" ]] || { sites_db_del "$file"; return 0; }
+    out="$(tmpf)"
+    strip_managed "$file" > "$out"
+    if cmp -s "$out" "$file"; then sites_db_del "$file"; return 0; fi
+    bak="$(backup_file "$file")"
+    replace_file "$out" "$file"
+    if ! nginx_test; then
+        replace_file "$bak" "$file"
+        err "nginx -t failed after cleaning $file; original restored"
+        return 1
+    fi
+    sites_db_del "$file"
+    ok "removed cf-nginx includes from $file"
+}
+
+cmd_disable() {
+    [[ $# -eq 1 ]] || die "usage: $PROG disable <site|file>"
+    preflight disable "$@"
+    local file; file="$(resolve_site "$1")"
+    disable_file "$file" || exit 1
+    nginx_reload
+}
+
+# --------------------------------------------------------------------------
+# UFW (optional): diff-based sync of allow rules for Cloudflare -> UFW_PORTS
+# --------------------------------------------------------------------------
+UFW_DB=""
+
+ufw_sync() {
+    command -v ufw >/dev/null 2>&1 || { warn "ufw is not installed; skipping firewall sync"; return 0; }
+    local want have tmp c p added=0 removed=0 failed=0
+    want="$(tmpf)"; have="$(tmpf)"; tmp="$(tmpf)"
+    cf_ranges | sed "s|\$| $UFW_PORTS|" | sort -u > "$want"
+    { [[ -f "$UFW_DB" ]] && sort -u "$UFW_DB"; } > "$have" || true
+    : > "$tmp"
+    # add first, then remove stale, so there is never a window with no rule.
+    while read -r c p; do
+        if ufw allow proto tcp from "$c" to any port "$p" comment "cf-nginx" >/dev/null 2>&1; then
+            added=$((added + 1)); printf '%s %s\n' "$c" "$p" >> "$tmp"
+        else
+            failed=$((failed + 1)); warn "ufw: could not add rule for $c"
+        fi
+    done < <(comm -13 "$have" "$want")
+    while read -r c p; do
+        ufw delete allow proto tcp from "$c" to any port "$p" >/dev/null 2>&1 || true
+        removed=$((removed + 1))
+    done < <(comm -23 "$have" "$want")
+    comm -12 "$have" "$want" >> "$tmp"
+    sort -u "$tmp" > "$UFW_DB.tmp" && mv -f "$UFW_DB.tmp" "$UFW_DB"
+    if (( added || removed )); then
+        ok "ufw: +$added -$removed rules (ports $UFW_PORTS)"
+    else
+        info "ufw: rules up to date"
+    fi
+    if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
+        warn "ufw is inactive. Allow SSH first ('ufw allow OpenSSH'), then 'ufw default deny incoming' and 'ufw enable'"
+    fi
+    (( failed == 0 ))
+}
+
+ufw_remove_all() {
+    [[ -f "$UFW_DB" ]] || return 0
+    command -v ufw >/dev/null 2>&1 || { rm -f "$UFW_DB"; return 0; }
+    local c p n=0
+    while read -r c p; do
+        [[ -n "$c" ]] || continue
+        ufw delete allow proto tcp from "$c" to any port "$p" >/dev/null 2>&1 || true
+        n=$((n + 1))
+    done < "$UFW_DB"
+    rm -f "$UFW_DB"
+    ok "ufw: removed $n cf-nginx rules"
+}
+
+# v1 created rules "allow from X to any port 80|443 comment Cloudflare".
+ufw_remove_legacy() {
+    command -v ufw >/dev/null 2>&1 || return 0
+    local c port
+    while IFS= read -r c; do
+        for port in 80 443; do
+            ufw delete allow from "$c" to any port "$port" >/dev/null 2>&1 || true
+        done
+    done < <(cf_ranges)
+}
+
+cmd_ufw() {
+    case "${1:-}" in
+        on)
+            require_root ufw on; detect_nginx; take_lock
+            command -v ufw >/dev/null 2>&1 || die "ufw is not installed (apt install ufw)"
+            ensure_list 4; ensure_list 6
+            set_config UFW_SYNC yes
+            ufw_sync ;;
+        off)
+            require_root ufw off; take_lock
+            set_config UFW_SYNC no
+            ufw_remove_all ;;
+        sync)
+            require_root ufw sync; detect_nginx; take_lock
+            ensure_list 4; ensure_list 6
+            ufw_sync ;;
+        *) die "usage: $PROG ufw on|off|sync" ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+cmd_update() {
+    preflight update
+    local rc4=0 rc6=0
+    refresh_family 4 "$IPS_V4_URL" || rc4=$?
+    if is_yes "$ENABLE_IPV6"; then refresh_family 6 "$IPS_V6_URL" || rc6=$?; fi
+    ensure_list 4; ensure_list 6
+    refresh_origin_pull_ca
+    apply_generated || exit 1
+    if (( rc4 == 0 && rc6 == 0 )); then
+        date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DIR/last-success"
+    fi
+    if is_yes "$UFW_SYNC"; then ufw_sync || true; fi
+    if (( rc4 || rc6 )); then
+        warn "download failed; kept the last known good lists"
+        exit 2
+    fi
+}
+
+install_timer() {
+    local sbin unit_dir
+    sbin="$SELF"
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        rm -f /etc/cron.d/cf-nginx
+        # Allow the hardened unit to write a non-default nginx conf dir.
+        unit_dir=/etc/systemd/system/cf-nginx-update.service.d
+        if [[ "$NGINX_CONF_DIR" != /etc/nginx ]]; then
+            mkdir -p "$unit_dir"
+            printf '[Service]\nReadWritePaths=%s\n' "$NGINX_CONF_DIR" > "$unit_dir/paths.conf"
+        else
+            rm -f "$unit_dir/paths.conf"; rmdir "$unit_dir" 2>/dev/null || true
+        fi
+        systemctl daemon-reload
+        if systemctl list-unit-files cf-nginx-update.timer >/dev/null 2>&1 \
+            && systemctl enable --now cf-nginx-update.timer >/dev/null 2>&1; then
+            ok "daily refresh scheduled (systemd: cf-nginx-update.timer)"
+            return 0
+        fi
+        warn "cf-nginx-update.timer unit not found; falling back to cron"
+    fi
+    local minute=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 60 ))
+    printf '# cf-nginx daily Cloudflare IP refresh\nSHELL=/bin/sh\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n%s 3 * * * root %s update --quiet 2>&1 | logger -t cf-nginx\n' \
+        "$minute" "$sbin" > /etc/cron.d/cf-nginx
+    chmod 0644 /etc/cron.d/cf-nginx
+    ok "daily refresh scheduled (cron: /etc/cron.d/cf-nginx at 03:$(printf '%02d' "$minute"))"
+}
+
+migrate_v1() {
+    # Old units/scripts from cf-nginx 1.x
+    if [[ -f /etc/systemd/system/cf-nginx.timer || -f /etc/systemd/system/cf-nginx.service ]]; then
+        if grep -qs 'cf-ips.sh' /etc/systemd/system/cf-nginx.service; then
+            systemctl disable --now cf-nginx.timer >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/cf-nginx.timer /etc/systemd/system/cf-nginx.service
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            info "removed legacy cf-nginx 1.x systemd units"
+        fi
+    fi
+    local legacy="$STATE_DIR/enabled_sites" site file migrated=0
+    if [[ -f "$legacy" ]]; then
+        info "migrating sites from cf-nginx 1.x"
+        while IFS= read -r site; do
+            [[ -n "$site" ]] || continue
+            file="$NGINX_CONF_DIR/sites-available/$site"
+            [[ -f "$file" ]] || continue
+            if cmd_enable_internal "$file"; then migrated=$((migrated + 1))
+            else warn "could not migrate $site; re-run '$PROG enable $site'"; fi
+        done < "$legacy"
+        mv -f "$legacy" "$legacy.migrated"
+        (( migrated == 0 )) || nginx_reload
+    fi
+    if [[ -f "$STATE_DIR/ufw_enabled" ]]; then
+        ufw_remove_legacy
+        rm -f "$STATE_DIR/ufw_enabled"
+        set_config UFW_SYNC yes
+        info "migrated legacy UFW rules to cf-nginx managed rules"
+    fi
+    rm -f "$STATE_DIR/ips.json"
+    find "$NGINX_CONF_DIR/sites-available" -maxdepth 1 -name '*.bak-[0-9]*' -type f 2>/dev/null \
+        | grep -q . && warn "old cf-nginx 1.x backups (*.bak-*) remain in $NGINX_CONF_DIR/sites-available; review and delete them"
+    return 0
+}
+
+cmd_enable_internal() { # file (already locked/preflighted); real-ip only
+    local file="$1" stripped out res count skipped bak
+    stripped="$(tmpf)"; out="$(tmpf)"; res="$(tmpf)"
+    strip_managed "$file" > "$stripped"
+    insert_includes "include $CF_DIR/real-ip.conf;" < "$stripped" > "$out" 3> "$res"
+    read -r count skipped < "$res"
+    (( count > 0 )) || return 1
+    cmp -s "$out" "$file" && { sites_db_add "$file" real-ip; return 0; }
+    bak="$(backup_file "$file")"
+    replace_file "$out" "$file"
+    if ! nginx_test; then replace_file "$bak" "$file"; return 1; fi
+    sites_db_add "$file" real-ip
+    ok "migrated $file"
+}
+
+cmd_setup() {
+    preflight setup
+    if [[ ! -f "$CONFIG_FILE" && -f "$SHARE_DIR/cf-nginx.conf" ]]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        install -m 0644 "$SHARE_DIR/cf-nginx.conf" "$CONFIG_FILE"
+    fi
+    (( REALIP_MODULE )) || warn "nginx lacks ngx_http_realip_module: real IP restoration will be unavailable"
+    local rc=0
+    refresh_family 4 "$IPS_V4_URL" || rc=1
+    if is_yes "$ENABLE_IPV6"; then refresh_family 6 "$IPS_V6_URL" || rc=1; fi
+    ensure_list 4; ensure_list 6
+    (( rc == 0 )) && date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DIR/last-success"
+    refresh_origin_pull_ca
+    apply_generated || die "setup failed; nothing was changed"
+    migrate_v1
+    install_timer
+    if ! http_layer_loaded; then
+        warn "nginx does not load $CF_DIR/http.conf (no conf.d include in nginx.conf?)."
+        warn "Add this line inside the http {} block of $NGINX_CONF_DIR/nginx.conf:"
+        warn "    include $CF_DIR/http.conf;"
+    fi
+    if is_yes "$UFW_SYNC"; then ufw_sync || true; fi
+    info ""
+    info "${C_BLD}cf-nginx is ready.${C_OFF} Next steps:"
+    info "  $PROG enable <site>            restore real visitor IPs for a site"
+    info "  $PROG enable <site> --lock     ...and only accept traffic from Cloudflare"
+    info "  $PROG global-real-ip on        restore real visitor IPs for every site"
+    info "  $PROG snippets                 show all include snippets"
+    info "  $PROG status                   health check"
+}
+
+cmd_global_real_ip() {
+    case "${1:-}" in
+        on|off) ;;
+        *) die "usage: $PROG global-real-ip on|off" ;;
+    esac
+    preflight global-real-ip "$1"
+    (( REALIP_MODULE )) || die "this nginx has no realip module"
+    local prev="$GLOBAL_REAL_IP"
+    if [[ "$1" == on ]]; then
+        http_layer_loaded || die "$CF_DIR/http.conf is not loaded by nginx; see '$PROG status'"
+        set_config GLOBAL_REAL_IP yes
+    else
+        set_config GLOBAL_REAL_IP no
+    fi
+    ensure_list 4; ensure_list 6
+    if ! apply_generated; then
+        set_config GLOBAL_REAL_IP "$prev"
+        die "could not switch global real IP (do some sites still include real-ip.conf? run '$PROG disable <site>' first)"
+    fi
+    ok "global real IP restoration: $1"
+}
+
+cmd_origin_pull() {
+    case "${1:-}" in
+        on|off) ;;
+        *) die "usage: $PROG origin-pull on|off" ;;
+    esac
+    preflight origin-pull "$1"
+    if [[ "$1" == on ]]; then
+        set_config ORIGIN_PULL_CA yes
+        refresh_origin_pull_ca
+        [[ -s "$STATE_DIR/origin-pull-ca.pem" ]] || { set_config ORIGIN_PULL_CA no; die "could not obtain the origin pull CA"; }
+    else
+        if grep -rlsF "$CF_DIR/origin-pull.conf" "$NGINX_CONF_DIR" | grep -v "^$CF_DIR/" | grep -q .; then
+            die "some sites still include origin-pull.conf; run '$PROG disable <site>' first"
+        fi
+        set_config ORIGIN_PULL_CA no
+    fi
+    ensure_list 4; ensure_list 6
+    apply_generated || exit 1
+    ok "Authenticated Origin Pulls snippet: $1"
+}
+
+cmd_uninstall() { # remove all nginx/firewall integration; files are removed by the package/installer
+    local purge=0 a
+    for a in "$@"; do
+        case "$a" in
+            --purge) purge=1 ;;
+            *) die "unknown option $a" ;;
+        esac
+    done
+    require_root uninstall
+    take_lock
+    local have_nginx=1
+    ( detect_nginx ) >/dev/null 2>&1 || have_nginx=0
+    if (( have_nginx )); then
+        detect_nginx
+        local f files=()
+        [[ -f "$SITES_DB" ]] && while IFS=$'\t' read -r f _; do files+=("$f"); done < "$SITES_DB"
+        while IFS= read -r f; do files+=("$f"); done < <(grep -rlsF "$MARK" "$NGINX_CONF_DIR" 2>/dev/null | grep -v "^$CF_DIR/" || true)
+        if (( ${#files[@]} )); then
+            while IFS= read -r f; do disable_file "$f" || warn "left $f untouched"; done < <(printf '%s\n' "${files[@]}" | sort -u)
+        fi
+        # Keep a copy: if hand-written config still uses our snippets or
+        # $cf_* variables, removing them would break nginx on next restart.
+        local keep="$TMPD/keep"
+        mkdir -p "$keep"
+        [[ -d "$CF_DIR" ]] && cp -a "$CF_DIR" "$keep/cloudflare"
+        [[ -f "$HOOK_FILE" ]] && cp -a "$HOOK_FILE" "$keep/hook.conf"
+        rm -f -- "$HOOK_FILE"
+        rm -rf -- "$CF_DIR"
+        if nginx_test 2>/dev/null; then
+            nginx_reload || true
+        else
+            [[ -d "$keep/cloudflare" ]] && cp -a "$keep/cloudflare" "$CF_DIR"
+            [[ -f "$keep/hook.conf" ]] && cp -a "$keep/hook.conf" "$HOOK_FILE"
+            err "your nginx config still references cf-nginx snippets or \$cf_* variables:"
+            grep -rnsE "$CF_DIR/|\\\$cf_[a-z_]+" "$NGINX_CONF_DIR" 2>/dev/null | grep -v "^$CF_DIR/" | grep -v "^$HOOK_FILE:" | head -n 20 >&2 || true
+            die "remove those references, then run '$PROG uninstall' again (nothing was removed from nginx)"
+        fi
+    fi
+    ufw_remove_all
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl disable --now cf-nginx-update.timer >/dev/null 2>&1 || true
+    fi
+    rm -rf /etc/systemd/system/cf-nginx-update.service.d
+    rm -f /etc/cron.d/cf-nginx
+    if (( purge )); then
+        rm -rf -- "$STATE_DIR" "$(dirname "$CONFIG_FILE")"
+    else
+        rm -f -- "$SITES_DB"
+    fi
+    ok "cf-nginx integration removed"
+}
+
+cmd_status() {
+    require_root status
+    detect_nginx
+    local problems=0 v4=0 v6=0 last age_days
+    [[ -f "$STATE_DIR/ips-v4.txt" ]] && v4="$(wc -l < "$STATE_DIR/ips-v4.txt")"
+    [[ -f "$STATE_DIR/ips-v6.txt" ]] && v6="$(wc -l < "$STATE_DIR/ips-v6.txt")"
+    printf '%scf-nginx %s%s\n' "$C_BLD" "$VERSION" "$C_OFF"
+    printf '  nginx:            %s (%s)\n' "$("$NGINX_BIN" -v 2>&1 | sed 's/^nginx version: //')" "$NGINX_BIN"
+    printf '  config dir:       %s\n' "$NGINX_CONF_DIR"
+    if (( REALIP_MODULE )); then echo "  realip module:    yes"; else echo "  realip module:    NO (real IP restoration unavailable)"; problems=1; fi
+    printf '  Cloudflare IPs:   %s IPv4, %s IPv6\n' "$v4" "$v6"
+    if [[ -f "$STATE_DIR/last-success" ]]; then
+        last="$(cat "$STATE_DIR/last-success")"
+        age_days=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+        printf '  last download:    %s (%s day(s) ago)\n' "$last" "$age_days"
+        (( age_days <= 3 )) || { warn "IP lists have not been refreshed for $age_days days"; problems=1; }
+    else
+        echo "  last download:    never"; problems=1
+    fi
+    if [[ -f "$CF_DIR/http.conf" ]]; then echo "  snippets:         $CF_DIR"; else echo "  snippets:         missing (run: $PROG setup)"; problems=1; fi
+    if http_layer_loaded; then echo "  http.conf loaded: yes"
+    else echo "  http.conf loaded: NO (add 'include $CF_DIR/http.conf;' to http {})"; problems=1; fi
+    printf '  global real IP:   %s\n' "$GLOBAL_REAL_IP"
+    printf '  ufw sync:         %s\n' "$UFW_SYNC"
+    printf '  origin pull CA:   %s\n' "$ORIGIN_PULL_CA"
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-enabled --quiet cf-nginx-update.timer 2>/dev/null; then
+            printf '  schedule:         systemd timer (next: %s)\n' \
+                "$(systemctl show cf-nginx-update.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo '?')"
+        elif [[ -f /etc/cron.d/cf-nginx ]]; then echo "  schedule:         cron"
+        else echo "  schedule:         NONE"; problems=1; fi
+    elif [[ -f /etc/cron.d/cf-nginx ]]; then echo "  schedule:         cron"
+    else echo "  schedule:         NONE"; problems=1; fi
+    echo "  sites:"
+    if [[ -s "$SITES_DB" ]]; then
+        local f fl
+        while IFS=$'\t' read -r f fl; do printf '    %s  [%s]\n' "$f" "$fl"; done < "$SITES_DB"
+    else
+        echo "    (none; use '$PROG enable <site>')"
+    fi
+    return "$problems"
+}
+
+cmd_snippets() {
+    detect_nginx
+    cat <<EOF
+Include these anywhere in your nginx config. All are generated in $CF_DIR
+and refreshed automatically; you never need to edit IP lists by hand.
+
+  Real visitor IP (http, server or location):
+      include $CF_DIR/real-ip.conf;
+
+  Only allow traffic through Cloudflare (server or location):
+      include $CF_DIR/origin-lock.conf;
+
+  Forward trusted Cloudflare headers to an app (location with proxy_pass):
+      include $CF_DIR/proxy-headers.conf;
+
+  Same for PHP-FPM (after 'include fastcgi_params;'):
+      include $CF_DIR/fastcgi-params.conf;
+
+  Authenticated Origin Pulls / mTLS (server with listen 443 ssl; '$PROG origin-pull on'):
+      include $CF_DIR/origin-pull.conf;
+
+  Access log with CF-Ray and country:
+      access_log /var/log/nginx/access.log cloudflare;
+
+Variables available everywhere (defined in http.conf):
+  \$cf_is_cloudflare   1 if the connection came from a Cloudflare edge
+  \$cf_connecting_ip   visitor IP from Cloudflare (empty if not via Cloudflare)
+  \$cf_country         CF-IPCountry (e.g. US, T1 for Tor)
+  \$cf_ray             CF-Ray ID
+  \$cf_scheme          http/https the visitor used to reach Cloudflare
+  \$cf_https           "on" when \$cf_scheme is https
+  \$cf_origin_allowed  1 for Cloudflare or ORIGIN_LOCK_ALLOW addresses
+
+Example: block a country
+      if (\$cf_country = "XX") { return 403; }
+EOF
+}
+
+cmd_ips() {
+    local f
+    for f in "$STATE_DIR/ips-v4.txt" "$STATE_DIR/ips-v6.txt"; do
+        [[ -f "$f" ]] && cat "$f"
+    done
+    return 0
+}
+
+usage() {
+    cat <<EOF
+cf-nginx $VERSION - Cloudflare toolkit for nginx
+
+Usage: $PROG <command> [options]
+
+Setup
+  setup                       Detect nginx, download IP lists, generate snippets,
+                              schedule daily refresh (run once after install)
+  update [--force]            Refresh Cloudflare IPs now (--force skips shrink check)
+  status                      Health check (non-zero exit on problems)
+  uninstall [--purge]         Remove all nginx/firewall integration
+
+Sites (edits only marked 'include' lines, with backup + nginx -t + rollback)
+  enable <site> [--lock] [--origin-pull] [--no-real-ip]
+                              <site> is a name in sites-available/ or conf.d/,
+                              or a path to a config file
+  disable <site>              Remove cf-nginx includes from a site
+
+Features
+  global-real-ip on|off       Real visitor IP for all sites (http level)
+  origin-pull on|off          Manage Authenticated Origin Pulls (mTLS) snippet
+  ufw on|off|sync             Allow ports $UFW_PORTS only from Cloudflare in UFW
+  snippets                    Show include snippets and variables
+  ips                         Print the current Cloudflare ranges
+
+Options: -q/--quiet  -h/--help  -V/--version
+Config:  $CONFIG_FILE
+EOF
+}
+
+main() {
+    local args=() a
+    for a in "$@"; do
+        case "$a" in
+            -q|--quiet) QUIET=1 ;;
+            --force) FORCE=1 ;;
+            -h|--help) usage; exit 0 ;;
+            -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+            *) args+=("$a") ;;
+        esac
+    done
+    set -- "${args[@]+"${args[@]}"}"
+    load_config
+    validate_config
+    SITES_DB="$STATE_DIR/sites"
+    UFW_DB="$STATE_DIR/ufw-rules"
+
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+        setup)          cmd_setup "$@" ;;
+        update)         cmd_update "$@" ;;
+        enable)         cmd_enable "$@" ;;
+        disable)        cmd_disable "$@" ;;
+        status|check)   cmd_status "$@" ;;
+        global-real-ip) cmd_global_real_ip "$@" ;;
+        origin-pull)    cmd_origin_pull "$@" ;;
+        ufw)            cmd_ufw "$@" ;;
+        snippets)       cmd_snippets ;;
+        ips|list)       cmd_ips ;;
+        uninstall)      cmd_uninstall "$@" ;;
+        help)           usage ;;
+        version)        echo "$PROG $VERSION" ;;
+        *)              usage >&2; exit 64 ;;
+    esac
+}
+
+# Allow `source bin/cf-nginx` from tests without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

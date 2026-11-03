@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Cloudflare IP refresh for nginx (cf-nginx)
+Documentation=https://github.com/cfunkz/cf-nginx
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=2h
+OnBootSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
