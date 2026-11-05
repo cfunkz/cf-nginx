@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- New `cf-nginx domain add|csr|remove|list`: one command per domain generates a hardened TLS site in one of three modes:
+  - `--public` (VPS behind Cloudflare): origin locked to Cloudflare, real visitor IPs, optional Authenticated Origin Pulls, HTTP→HTTPS redirect.
+  - `--local` (homelab/LAN): only private networks (or `--allow` CIDRs) may connect, optional `--listen` on one LAN IP.
+  - `--tunnel` (cloudflared): plain HTTP on loopback only, no open ports, visitor IP from the tunnel.
+- Certificates from `--origin-ca` (15-year Cloudflare Origin CA cert issued through the API; key generated on the server, token never on the command line), `--cert/--key`, `domain csr`, an interactive paste, or `--self-signed`.
+- Every certificate is checked before use: not expired, matches the key, covers every hostname, no RSA < 2048, no MD5/SHA-1, no passphrase-protected keys. Keys are stored in `/etc/cf-nginx/certs/<domain>/` (0700, key 0600).
+- Generated sites use TLS 1.2/1.3 with AEAD ciphers only, no session tickets, no session cache with client certs (CVE-2025-23419), `server_tokens off`, security headers, optional HSTS, and deny dotfiles for static roots.
+- Public domains add a TLS catch-all (`ssl_reject_handshake`) so scanning the origin IP reveals no hostnames or certificates.
+- `status` reports domain certificates that are missing or expire within 14 days; `uninstall` disables generated domain sites.
+- `http.conf` now defines `$cf_conn_upgrade` for WebSocket proxying.
+
 ## 2.0.0
 
 Complete rewrite.

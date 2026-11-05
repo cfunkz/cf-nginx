@@ -16,6 +16,7 @@ FX="$(mktemp -d)"
 PORT=18080
 SITE=/etc/nginx/sites-available/cftest
 PASS=0 FAIL=0
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy   # all requests are local
 
 pass() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
@@ -193,11 +194,118 @@ check_not "no command substitution from config" test -e /tmp/cf-nginx-pwned
 sed -i '$d' /etc/cf-nginx/cf-nginx.conf
 
 # ---------------------------------------------------------------------------
+section "unit: domain / URL validation"
+for d in example.com a.b.example.co.uk '*.example.com' xn--bcher-kva.example home.arpa nas.lan 1password.com; do
+    check "domain ok $d" valid_domain "$d"
+done
+for d in localhost 'exa mple.com' example.com. .example.com 'a*.example.com' '*.*.example.com' 'example.com;' \
+         1.2.3.4 -a.example.com a-.example.com a_b.example.com ../etc.com EXAMPLE.COM 'a.com}' 'a..com' '*.com'; do
+    check_not "domain reject $d" valid_domain "$d"
+done
+for u in http://127.0.0.1:3000 https://backend.lan:8443/app "http://[::1]:8080" http://unix:/run/app.sock; do
+    check "proxy ok $u" valid_proxy_url "$u"
+done
+for u in 'http://127.0.0.1:3000;' 'http://x/$host' 'http://a b' ftp://x 'http://x}' 'http://x;return 200' ''; do
+    check_not "proxy reject '$u'" valid_proxy_url "$u"
+done
+check_not "root /etc rejected" valid_root_dir /etc/nginx
+check_not "root with .. rejected" valid_root_dir /var/www/../../etc
+printf '{"success":true,"errors":[],"result":{"id":"1","certificate":"-----BEGIN CERTIFICATE-----\\nQUJD\\/REVG\\n-----END CERTIFICATE-----\\n","hostnames":["a.test"]}}' > "$FX/api.json"
+eq "Origin CA response parsed" "$(cf_json_certificate "$FX/api.json")" $'-----BEGIN CERTIFICATE-----\nQUJD/REVG\n-----END CERTIFICATE-----'
+
+# ---------------------------------------------------------------------------
+section "domains: certificate checks"
+sed -i 's|^ORIGIN_LOCK_ALLOW=.*|ORIGIN_LOCK_ALLOW=|' /etc/cf-nginx/cf-nginx.conf
+"$CFN" update -q
+chmod 0755 "$FX"
+mkdir -p "$FX/www"; echo hello > "$FX/www/index.html"; chmod -R a+rX "$FX/www"
+ss() { # key cert host
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -sha256 -days 30 \
+        -subj "/CN=$3" -addext "subjectAltName=DNS:$3,DNS:www.$3" -keyout "$1" -out "$2" >/dev/null 2>&1
+}
+ss "$FX/pub.key" "$FX/pub.crt" pub.test
+ss "$FX/other.key" "$FX/other.crt" other.test
+openssl req -x509 -newkey rsa:1024 -nodes -sha256 -days 30 -subj /CN=pub.test -addext subjectAltName=DNS:pub.test \
+    -keyout "$FX/weak.key" -out "$FX/weak.crt" >/dev/null 2>&1
+openssl pkey -in "$FX/pub.key" -aes256 -passout pass:secret -out "$FX/enc.key" 2>/dev/null
+PUBARGS=(--public --proxy "http://127.0.0.1:$PORT")
+check_not "mismatched key rejected" "$CFN" domain add pub.test "${PUBARGS[@]}" --cert "$FX/pub.crt" --key "$FX/other.key" -q
+check_not "cert for another host rejected" "$CFN" domain add pub.test "${PUBARGS[@]}" --cert "$FX/other.crt" --key "$FX/other.key" -q
+check_not "alias not covered rejected" "$CFN" domain add pub.test --alias api.pub.test "${PUBARGS[@]}" --cert "$FX/pub.crt" --key "$FX/pub.key" -q
+check_not "RSA-1024 rejected" "$CFN" domain add pub.test "${PUBARGS[@]}" --cert "$FX/weak.crt" --key "$FX/weak.key" -q
+check_not "encrypted key rejected" "$CFN" domain add pub.test "${PUBARGS[@]}" --cert "$FX/pub.crt" --key "$FX/enc.key" -q
+check_not "nginx injection in --proxy rejected" "$CFN" domain add pub.test --public --proxy 'http://127.0.0.1:1;}' --cert "$FX/pub.crt" --key "$FX/pub.key" -q
+check_not "mode is required" "$CFN" domain add pub.test --proxy http://127.0.0.1:1 --cert "$FX/pub.crt" --key "$FX/pub.key" -q
+check_not "--allow 0.0.0.0/0 rejected" "$CFN" domain add lan.test --local --self-signed --root "$FX/www" --allow 0.0.0.0/0 -q
+check_not "nothing written after rejections" test -e /etc/nginx/sites-available/pub.test.conf
+echo 'server { listen 127.0.0.1:18099; server_name taken.test; return 204; }' > /etc/nginx/sites-available/taken.test.conf
+check_not "refuses to overwrite a hand-written site" "$CFN" domain add taken.test --local --self-signed --root "$FX/www" -q
+rm -f /etc/nginx/sites-available/taken.test.conf
+
+# ---------------------------------------------------------------------------
+section "domains: public (VPS behind Cloudflare)"
+check "add public domain" "$CFN" domain add pub.test --alias www.pub.test "${PUBARGS[@]}" --cert "$FX/pub.crt" --key "$FX/pub.key" --hsts -q
+check "site enabled" test -L /etc/nginx/sites-enabled/pub.test.conf
+eq "key is 0600 root" "$(stat -c '%a %U' /etc/cf-nginx/certs/pub.test/key.pem)" "600 root"
+eq "cert dir is 0700" "$(stat -c '%a' /etc/cf-nginx/certs/pub.test)" 700
+check "origin lock included" grep -q 'cloudflare/origin-lock.conf' /etc/nginx/sites-available/pub.test.conf
+sget() { sleep 0.7; curl -sk -o /dev/null -w '%{http_code}' --resolve "$1:443:127.0.0.1" "https://$1/" "${@:2}"; }
+eq "https via Cloudflare edge works" "$(sget pub.test)" 200
+eq "alias works" "$(sget www.pub.test)" 200
+check "HSTS + nosniff sent" bash -c "curl -sk -D- -o /dev/null --resolve pub.test:443:127.0.0.1 https://pub.test/ | grep -qi 'strict-transport-security' && curl -sk -D- -o /dev/null --resolve pub.test:443:127.0.0.1 https://pub.test/ | grep -qi 'x-content-type-options: nosniff'"
+check_not "no nginx version leaked" bash -c "curl -sk -D- -o /dev/null --resolve pub.test:443:127.0.0.1 https://pub.test/ | grep -qi '^server: nginx/'"
+eq "http redirects to https" "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: pub.test' http://127.0.0.1/)" 301
+check_not "TLS 1.1 refused" curl -sk --tls-max 1.1 --resolve pub.test:443:127.0.0.1 https://pub.test/
+check "TLS catch-all installed" test -f /etc/nginx/conf.d/00-cf-nginx-default-tls.conf
+check_not "unknown SNI gets no certificate" curl -sk --resolve nope.test:443:127.0.0.1 https://nope.test/
+printf '173.245.48.0/20\n103.21.244.0/22\n104.16.0.0/13\n' > "$FX/v4"
+"$CFN" update --force -q
+eq "non-Cloudflare client blocked on https" "$(sget pub.test)" 403
+printf '127.0.0.0/8\n173.245.48.0/20\n103.21.244.0/22\n' > "$FX/v4"
+"$CFN" update --force -q
+check "re-run without cert reuses the stored one" "$CFN" domain add pub.test --alias www.pub.test --public --root "$FX/www" -q
+eq "re-run switched to static root" "$(sleep 0.7; curl -sk --resolve pub.test:443:127.0.0.1 https://pub.test/)" hello
+check "dotfiles denied" bash -c "sleep 0.5; [ \"\$(curl -sk -o /dev/null -w '%{http_code}' --resolve pub.test:443:127.0.0.1 https://pub.test/.env)\" = 403 ]"
+
+# ---------------------------------------------------------------------------
+section "domains: local (homelab)"
+check "add local domain (self-signed)" "$CFN" domain add nas.lan --local --self-signed --root "$FX/www" -q
+eq "LAN client allowed" "$(sleep 0.7; curl -sk --resolve nas.lan:443:127.0.0.1 https://nas.lan/)" hello
+check "self-signed cert covers name" bash -c "openssl x509 -in /etc/cf-nginx/certs/nas.lan/cert.pem -noout -checkhost nas.lan | grep -q 'does match'"
+check_not "no origin lock on local sites" grep -q origin-lock /etc/nginx/sites-available/nas.lan.conf
+check "restrict to another subnet" "$CFN" domain add nas.lan --local --root "$FX/www" --allow 192.168.50.0/24 -q
+eq "client outside --allow denied" "$(sget nas.lan)" 403
+
+# ---------------------------------------------------------------------------
+section "domains: tunnel (cloudflared)"
+check "add tunnel domain" "$CFN" domain add tun.test --tunnel --port 18090 --root "$FX/www" -q
+check "listens on loopback only" bash -c "grep 'listen' /etc/nginx/sites-available/tun.test.conf | grep -vq '127.0.0.1\\|\\[::1\\]' && exit 1 || exit 0"
+eq "tunnel origin serves" "$(sleep 0.7; curl -s -H 'Host: tun.test' -H 'CF-Connecting-IP: 198.51.100.77' http://127.0.0.1:18090/)" hello
+sleep 0.5
+check "visitor IP from tunnel logged" grep -q '^198.51.100.77 ' /var/log/nginx/tun.test.access.log
+check_not "tunnel rejects --cert" "$CFN" domain add tun.test --tunnel --root "$FX/www" --self-signed -q
+
+# ---------------------------------------------------------------------------
+section "domains: csr, list, status, remove"
+check "csr" bash -c "'$CFN' domain csr csr.test | grep -q 'BEGIN CERTIFICATE REQUEST'"
+eq "csr key is 0600" "$(stat -c '%a' /etc/cf-nginx/certs/csr.test/key.pem)" 600
+check "list shows domains" bash -c "'$CFN' domain list | grep -q '^pub.test .*public'"
+check "status ok with domains" "$CFN" status
+check "remove local domain" "$CFN" domain remove nas.lan -q
+check_not "local site file gone" test -e /etc/nginx/sites-available/nas.lan.conf
+check "keys kept by default" test -f /etc/cf-nginx/certs/nas.lan/key.pem
+check "remove public domain + keys" "$CFN" domain remove pub.test --delete-keys -q
+check_not "keys deleted" test -e /etc/cf-nginx/certs/pub.test
+check_not "catch-all removed with last public domain" test -e /etc/nginx/conf.d/00-cf-nginx-default-tls.conf
+check "nginx -t ok after removals" nginx -t
+
+# ---------------------------------------------------------------------------
 section "uninstall"
 check_not "uninstall refuses while config uses \$cf_ vars" "$CFN" uninstall -q
 check "nginx still valid after refused uninstall" nginx -t
 sed -i 's/ cc=\$cf_country scheme=\$cf_scheme ray=\$cf_ray cf=\$cf_is_cloudflare//' "$SITE" "$FX/site.orig"
 check "uninstall" "$CFN" uninstall -q
+check_not "tunnel domain disabled by uninstall" test -e /etc/nginx/sites-enabled/tun.test.conf
 check "site restored" cmp "$SITE" "$FX/site.orig"
 check_not "hook removed" test -e /etc/nginx/conf.d/00-cloudflare.conf
 check_not "snippets removed" test -e /etc/nginx/cloudflare

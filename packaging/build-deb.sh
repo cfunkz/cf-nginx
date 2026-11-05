@@ -37,8 +37,10 @@ Description: Cloudflare toolkit for nginx (real IP, headers, origin lock)
  Generates nginx include snippets from Cloudflare's published IP ranges and
  keeps them up to date daily: real visitor IP restoration, trusted CF-*
  headers, origin lockdown to Cloudflare, Authenticated Origin Pulls and
- optional UFW firewall sync. Every change is validated with nginx -t and
- rolled back on failure.
+ optional UFW firewall sync. Also sets up hardened per-domain TLS sites for
+ a public VPS behind Cloudflare, a local homelab, or a Cloudflare Tunnel,
+ with Cloudflare Origin CA, your own or self-signed certificates. Every
+ change is validated with nginx -t and rolled back on failure.
 CTRL
 echo "/etc/cf-nginx/cf-nginx.conf" > "$ROOT/DEBIAN/conffiles"
 
