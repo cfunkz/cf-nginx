@@ -5,6 +5,10 @@
 ```bash
 sudo cf-nginx setup                       # once, after install
 sudo cf-nginx enable example.com --lock   # real visitor IPs + only allow Cloudflare
+
+# or create a new, hardened HTTPS site for a domain (public VPS, homelab, or Cloudflare Tunnel)
+sudo cf-nginx domain add example.com --public --origin-ca --proxy http://127.0.0.1:3000
+sudo cf-nginx domain add nas.home.arpa --local --self-signed --proxy http://127.0.0.1:5000
 ```
 
 ## Why
@@ -19,7 +23,7 @@ cf-nginx keeps one generated, validated copy of the list and gives you snippets 
 
 ## Install
 
-Requirements: Debian 11+ or Ubuntu 20.04+, nginx (distro or nginx.org packages), bash, curl. You need `ufw` only for firewall sync, and `openssl` only for Authenticated Origin Pulls.
+Requirements: Debian 11+ or Ubuntu 20.04+, nginx (distro or nginx.org packages), bash, curl. You need `ufw` only for firewall sync, and `openssl` only for Authenticated Origin Pulls and `cf-nginx domain`.
 
 **From source (zip or git):**
 
@@ -53,6 +57,49 @@ Both methods are idempotent, so running them again upgrades in place. Upgrading 
 After setup your sites behave exactly as before. Nothing changes until you include a snippet or run `cf-nginx enable`.
 
 ## Usage
+
+### Domains: new sites in one command
+
+`cf-nginx domain add` writes a complete, hardened TLS site for a domain, installs its key and certificate, runs `nginx -t` (rolling back on failure) and reloads. Pick where the site lives:
+
+```bash
+# Public VPS behind Cloudflare: Cloudflare Origin CA cert issued via the API, only Cloudflare may connect
+export CF_API_TOKEN=...    # token with Zone > SSL and Certificates > Edit (or use --token-file, or you'll be prompted)
+sudo -E cf-nginx domain add example.com --alias www.example.com --public --origin-ca --proxy http://127.0.0.1:3000
+
+# Homelab / LAN: only private networks may connect
+sudo cf-nginx domain add nas.home.arpa --local --self-signed --proxy http://127.0.0.1:5000
+sudo cf-nginx domain add jellyfin.example.com --local --cert fullchain.pem --key privkey.pem --proxy http://127.0.0.1:8096
+
+# Cloudflare Tunnel (cloudflared on this host): loopback only, no open ports at all
+sudo cf-nginx domain add app.example.com --tunnel --port 8080 --proxy http://127.0.0.1:3000
+```
+
+| Mode | Who can connect | Certificate | Good for |
+| --- | --- | --- | --- |
+| `--public` | Cloudflare edges only (`origin-lock.conf`), plus `ORIGIN_LOCK_ALLOW` | `--origin-ca` (recommended), `--cert/--key`, or `--self-signed` with SSL mode *Full* | A VPS with a public IP |
+| `--local` | `127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ::1 fc00::/7 fe80::/10`, or your `--allow` list | `--cert/--key` (e.g. Let's Encrypt via DNS-01), or `--self-signed` | A homelab with LAN DNS |
+| `--tunnel` | Only `cloudflared` on the same host (listens on 127.0.0.1) | None needed: Cloudflare terminates TLS | Home servers with no open ports |
+
+Serve with `--proxy URL` (an app; WebSockets work) or `--root DIR` (static files; dotfiles like `.git` and `.env` are denied). Other options: `--alias NAME` (repeatable), `--hsts`, `--origin-pull` (public, after `cf-nginx origin-pull on`), `--max-body 64m`, `--allow CIDR` and `--listen IP` (local), `--port N` (tunnel).
+
+**Bring your own key.** `sudo cf-nginx domain csr example.com` creates a private key on the server and prints a CSR. Paste it into Cloudflare (SSL/TLS → Origin Server → Create Certificate → *Use my private key and CSR*) or any CA, then run `domain add ... --cert cert.pem`; the stored key is used. Without any certificate option, `domain add` asks you to paste the certificate and key (the key is read hidden).
+
+**What gets checked and generated:**
+
+* The certificate must parse, not be expired, match the private key and cover every hostname. RSA keys under 2048 bits, MD5/SHA-1 signatures and passphrase-protected keys are refused. You get a warning when a certificate expires within 30 days, and `cf-nginx status` flags any that expire within 14 days. A Cloudflare Origin CA cert used outside `--public` gets a warning, because browsers only trust it through Cloudflare.
+* Keys live in `/etc/cf-nginx/certs/<domain>/` (directory 0700, key 0600, root only). With `--origin-ca` the key is generated on the server and only the CSR is sent; the API token is read from the environment, a file or a hidden prompt, never from the command line, and is not stored.
+* TLS 1.2 and 1.3 only, AEAD ciphers with forward secrecy, no session tickets, no session cache when client certificates are verified (CVE-2025-23419), `server_tokens off`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and HSTS with `--hsts`. HTTP redirects to HTTPS.
+* For public domains, a catch-all `default_server` on 443 with `ssl_reject_handshake on` means scanning your IP reveals no hostnames or certificates (needs nginx 1.19.4+; skipped if you already have a 443 `default_server`).
+* Domain names, upstream URLs and paths are strictly validated, so nothing can inject nginx directives. cf-nginx never overwrites a site file it did not create.
+
+```bash
+sudo cf-nginx domain list                      # domains, modes, certificate expiry
+sudo cf-nginx domain add example.com --public --root /var/www/example   # re-run to change; keeps the cert
+sudo cf-nginx domain remove example.com        # keeps keys; add --delete-keys to remove them
+```
+
+On a public VPS, also run `sudo ufw allow OpenSSH && sudo cf-nginx ufw on` so the firewall only lets Cloudflare reach ports 80 and 443. cf-nginx hardens the configuration it writes, but it can't patch nginx itself, so keep nginx updated (`unattended-upgrades` on Debian/Ubuntu).
 
 ### Per site (automatic)
 

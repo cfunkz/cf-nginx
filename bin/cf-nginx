@@ -449,6 +449,12 @@ map $cf_scheme $cf_https {
     https   on;
 }
 
+# WebSocket-friendly Connection header for proxy_pass (used by `cf-nginx domain`).
+map $http_upgrade $cf_conn_upgrade {
+    default upgrade;
+    ""      "";
+}
+
 EOF
         echo "# 1 = request must be rejected by origin-lock.conf."
         echo 'map "$cf_origin_allowed:$uri" $cf_origin_deny {'
@@ -884,6 +890,771 @@ cmd_ufw() {
 }
 
 # --------------------------------------------------------------------------
+# Domains: one generated, hardened TLS site per domain, in three modes
+#
+#   public  VPS on the internet behind Cloudflare: only Cloudflare (and
+#           ORIGIN_LOCK_ALLOW) may connect, real visitor IPs, optional mTLS.
+#   local   homelab/LAN: only private networks may connect, no Cloudflare.
+#   tunnel  cloudflared on this host: plain HTTP on loopback only, no open
+#           ports, visitor IP taken from the tunnel's CF-Connecting-IP.
+#
+# Keys and certificates live in $CERTS_DIR/<name>/ (0700, key 0600). Every
+# certificate is checked before use: parses, not expired, matches the key,
+# covers every hostname, no weak keys or SHA-1/MD5 signatures, and the key is
+# not passphrase protected (nginx would hang on start).
+# --------------------------------------------------------------------------
+DOMAINS_DB=""   # set in main: <name>\t<mode>\t<site file>\t<enable link or ->
+CERTS_DIR=""
+readonly DOMAIN_MARK="# cf-nginx-domain:"
+# RFC 1918, loopback, IPv6 ULA and link-local. CGNAT (100.64/10, Tailscale)
+# is deliberately not included: on some ISPs it holds other customers.
+readonly LOCAL_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 ::1/128 fc00::/7 fe80::/10"
+readonly CF_API="https://api.cloudflare.com/client/v4"
+readonly TLS_CIPHERS="ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
+
+# Lowercase DNS name, optionally a leading "*." wildcard. No IPs, no
+# trailing dot, nothing that could break out of an nginx directive or path.
+valid_domain() {
+    local d="$1" label
+    local -a labels
+    (( ${#d} >= 3 && ${#d} <= 253 )) || return 1
+    [[ "$d" =~ ^(\*\.)?[a-z0-9.-]+$ && "$d" != *. && "$d" != .* ]] || return 1
+    d="${d#\*.}"
+    [[ "$d" == *.* ]] || return 1
+    IFS=. read -r -a labels <<< "$d"
+    for label in "${labels[@]}"; do
+        [[ "$label" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || return 1
+    done
+    [[ "${labels[-1]}" =~ [a-z] ]]          # the TLD is never all digits
+}
+
+domain_slug() { # *.example.com -> wildcard.example.com (safe as a file name)
+    local d="$1"
+    [[ "$d" == \*.* ]] && d="wildcard.${d#\*.}"
+    printf '%s' "$d"
+}
+
+valid_proxy_url() {
+    [[ "$1" =~ ^https?://unix:/[A-Za-z0-9._/-]+$ ]] && return 0
+    [[ "$1" =~ ^https?://(\[[0-9A-Fa-f:]{2,39}\]|[A-Za-z0-9.-]{1,253})(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]
+}
+
+valid_root_dir() {
+    local p="$1"
+    [[ "$p" =~ ^/[A-Za-z0-9._/-]+$ && "$p" != */../* && "$p" != */.. && "$p" != */./* ]] || return 1
+    p="$(readlink -f "$p")" || return 1
+    case "$p/" in
+        /|/etc/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*|/run/*|/var/lib/*|/home/) return 1 ;;
+    esac
+    [[ -d "$p" ]]
+}
+
+nginx_version() { sed -n 's|^nginx version: [^/]*/\([0-9][0-9.]*\).*|\1|p' <<<"$NGINX_V" | head -n1; }
+version_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]]; } # a >= b
+have_ipv6() { [[ -s /proc/net/if_inet6 ]] && is_yes "$ENABLE_IPV6"; }
+
+need_openssl() { command -v openssl >/dev/null 2>&1 || die "openssl is required for domains (apt install openssl)"; }
+
+pubkey_hash() { # cert|key file
+    if [[ "$1" == cert ]]; then
+        openssl x509 -in "$2" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum
+    else
+        openssl pkey -in "$2" -passin pass: -pubout -outform DER 2>/dev/null | sha256sum
+    fi
+}
+
+# Validate a certificate + key pair for the given hostnames. Dies on anything
+# unsafe; warns on things worth knowing.
+cert_check() { # cert key mode names...
+    local cert="$1" key="$2" mode="$3" n h text bits
+    shift 3
+    need_openssl
+    grep -q -- '-----BEGIN CERTIFICATE-----' "$cert" 2>/dev/null \
+        && openssl x509 -in "$cert" -noout 2>/dev/null || die "$cert is not a PEM certificate"
+    grep -qE -- '-----BEGIN (EC |RSA )?PRIVATE KEY-----' "$key" 2>/dev/null \
+        || die "$key is not an unencrypted PEM private key (nginx cannot use passphrase-protected keys)"
+    grep -q -- 'Proc-Type: 4,ENCRYPTED' "$key" \
+        && die "$key is passphrase protected; decrypt it first: openssl pkey -in key.pem -out key-plain.pem"
+    openssl pkey -in "$key" -passin pass: -noout 2>/dev/null || die "$key could not be read as a private key"
+    [[ "$(pubkey_hash cert "$cert")" == "$(pubkey_hash key "$key")" ]] \
+        || die "the private key does not belong to this certificate"
+    text="$(openssl pkey -in "$key" -passin pass: -noout -text 2>/dev/null | head -n1)"
+    if [[ "$text" =~ \(([0-9]+)\ bit ]]; then
+        bits="${BASH_REMATCH[1]}"
+        if [[ "$text" == *primes* ]]; then
+            (( bits >= 2048 )) || die "RSA key is only $bits bits; use at least 2048 (or ECDSA P-256)"
+        else
+            (( bits >= 256 )) || die "key is only $bits bits; use ECDSA P-256 or stronger"
+        fi
+    fi
+    openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -m1 'Signature Algorithm' | grep -qiE 'md5|sha1With' \
+        && die "certificate uses a broken signature algorithm (MD5/SHA-1)"
+    openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || die "certificate has expired"
+    openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null 2>&1 \
+        || warn "certificate expires within 30 days ($(openssl x509 -in "$cert" -noout -enddate | cut -d= -f2))"
+    for n in "$@"; do
+        h="$n"; [[ "$h" == \*.* ]] && h="cf-nginx-check.${h#\*.}"
+        openssl x509 -in "$cert" -noout -checkhost "$h" 2>/dev/null | grep -q ' does match ' \
+            || die "certificate does not cover $n (check its Subject Alternative Names)"
+    done
+    if openssl x509 -in "$cert" -noout -issuer 2>/dev/null | grep -qi 'CloudFlare Origin'; then
+        [[ "$mode" == public ]] || warn "this is a Cloudflare Origin CA certificate: browsers only trust it through Cloudflare's proxy, not on a LAN"
+    fi
+    return 0
+}
+
+# Fresh ECDSA P-256 key (+ optional CSR) generated on this host, so the
+# private key never leaves it.
+make_key() { # dest
+    ( umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null ) \
+        || die "could not generate a private key"
+}
+make_csr() { # key dest names...
+    local key="$1" dest="$2" san="" n; shift 2
+    for n in "$@"; do san+="DNS:$n,"; done
+    openssl req -new -key "$key" -sha256 -subj "/CN=$1" -addext "subjectAltName=${san%,}" -out "$dest" 2>/dev/null \
+        || die "could not create a certificate signing request"
+}
+make_self_signed() { # key cert names...
+    local key="$1" cert="$2" san="" n; shift 2
+    for n in "$@"; do san+="DNS:$n,"; done
+    make_key "$key"
+    openssl req -x509 -new -key "$key" -sha256 -days 825 -subj "/CN=$1" \
+        -addext "subjectAltName=${san%,}" -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "keyUsage=critical,digitalSignature" -addext "extendedKeyUsage=serverAuth" \
+        -out "$cert" 2>/dev/null || die "could not create a self-signed certificate"
+}
+
+# Cloudflare API token: CF_API_TOKEN, a 0600 file, or a hidden prompt. Never
+# taken from the command line (it would show up in `ps` and shell history).
+read_api_token() { # token_file -> stdout
+    local tok="" f="$1"
+    if [[ -n "$f" ]]; then
+        [[ -f "$f" ]] || die "token file $f not found"
+        [[ "$(stat -c %a "$f")" =~ ^[0-7]00$ ]] || warn "$f is readable by other users; chmod 600 it"
+        tok="$(head -n1 "$f")"
+    elif [[ -n "${CF_API_TOKEN:-}" ]]; then
+        tok="$CF_API_TOKEN"
+    elif [[ -t 0 ]]; then
+        read -r -s -p "Cloudflare API token (Zone > SSL and Certificates > Edit): " tok; echo >&2
+    else
+        die "no API token: set CF_API_TOKEN or use --token-file FILE"
+    fi
+    tok="${tok%$'\r'}"; tok="${tok//[[:space:]]/}"
+    [[ "$tok" =~ ^[A-Za-z0-9_-]{20,200}$ ]] || die "that does not look like a Cloudflare API token"
+    printf '%s' "$tok"
+}
+
+# Pull the PEM out of a Cloudflare /certificates response without jq. The
+# value is base64 plus header lines, so it never contains a quote.
+cf_json_certificate() { # response_file -> PEM on stdout
+    grep -oE '"certificate"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" | head -n1 \
+        | sed -E -e 's/^"certificate"[[:space:]]*:[[:space:]]*"//' -e 's/"$//' -e 's|\\/|/|g' \
+        | awk '{ gsub(/\\n/, "\n"); printf "%s", $0 }'
+}
+cf_json_errors() {
+    grep -oE '"message"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" | head -n3 | sed -E 's/^"message"[[:space:]]*:[[:space:]]*"//; s/"$//' \
+        | tr -cd '[:print:]\n'
+}
+
+# Issue a 15-year Cloudflare Origin CA certificate for a CSR made on this host.
+cf_origin_ca_issue() { # csr dest_cert token_file names...
+    local csr="$1" dest="$2" tfile="$3" hdr body resp hosts="" n code
+    shift 3
+    hdr="$(tmpf)"; body="$(tmpf)"; resp="$(tmpf)"
+    chmod 0600 "$hdr"
+    printf 'Authorization: Bearer %s\n' "$(read_api_token "$tfile")" > "$hdr"
+    for n in "$@"; do hosts+="\"$n\","; done
+    printf '{"hostnames":[%s],"requested_validity":5475,"request_type":"origin-ecc","csr":"%s"}' \
+        "${hosts%,}" "$(awk '{ printf "%s\\n", $0 }' "$csr")" > "$body"
+    info "requesting a Cloudflare Origin CA certificate for $*"
+    code="$(curl --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 60 --max-filesize 1048576 \
+        --user-agent "cf-nginx/$VERSION" -H @"$hdr" -H 'Content-Type: application/json' \
+        --data-binary @"$body" -o "$resp" -w '%{http_code}' "$CF_API/certificates")" || code=000
+    rm -f -- "$hdr"
+    [[ "$code" != 000 ]] || die "could not reach $CF_API (network or proxy problem); nothing was changed"
+    if [[ "$code" != 200 ]] || ! grep -qE '"success"[[:space:]]*:[[:space:]]*true' "$resp"; then
+        err "Cloudflare API request failed (HTTP $code):"
+        cf_json_errors "$resp" | sed 's/^/    /' >&2
+        die "check that the token has Zone > SSL and Certificates > Edit for this zone"
+    fi
+    cf_json_certificate "$resp" > "$dest"
+    [[ -s "$dest" ]] || die "Cloudflare's response did not contain a certificate"
+}
+
+read_pem() { # prompt dest secret(0|1)
+    [[ -t 0 ]] || die "no certificate given: use --cert FILE --key FILE, --origin-ca or --self-signed"
+    local line n=0
+    local -a ro=(); (( $3 )) && ro+=(-s)
+    printf '%s\n' "$1" >&2
+    : > "$2"
+    while IFS= read -r "${ro[@]}" line; do
+        line="${line%$'\r'}"
+        if [[ -z "$line" ]]; then (( n == 0 )) && continue; break; fi
+        printf '%s\n' "$line" >> "$2"
+        n=$((n + 1))
+        (( n < 400 )) || die "input too long"
+        [[ "$line" =~ ^-----END\ .*PRIVATE\ KEY-----$ ]] && break
+    done
+    (( $3 )) && echo >&2
+    return 0
+}
+
+domains_db_get() { # name -> "mode\tfile\tlink" or fails
+    [[ -f "$DOMAINS_DB" ]] || return 1
+    awk -F'\t' -v n="$1" '$1 == n { print $2 "\t" $3 "\t" $4; f = 1 } END { exit !f }' "$DOMAINS_DB"
+}
+domains_db_set() { # name mode file link
+    local tmp
+    tmp="$(mktemp_tracked "$DOMAINS_DB.XXXXXX")"
+    { [[ -f "$DOMAINS_DB" ]] && awk -F'\t' -v n="$1" '$1 != n' "$DOMAINS_DB"; printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; } > "$tmp"
+    mv -f "$tmp" "$DOMAINS_DB"
+}
+domains_db_del() {
+    [[ -f "$DOMAINS_DB" ]] || return 0
+    local tmp
+    tmp="$(mktemp_tracked "$DOMAINS_DB.XXXXXX")"
+    awk -F'\t' -v n="$1" '$1 != n' "$DOMAINS_DB" > "$tmp"
+    mv -f "$tmp" "$DOMAINS_DB"
+}
+
+# Where a generated site goes: Debian layout if present, else conf.d.
+domain_paths() { # slug -> sets D_FILE, D_LINK
+    if [[ -d "$NGINX_CONF_DIR/sites-available" && -d "$NGINX_CONF_DIR/sites-enabled" ]]; then
+        D_FILE="$NGINX_CONF_DIR/sites-available/$1.conf"
+        D_LINK="$NGINX_CONF_DIR/sites-enabled/$1.conf"
+    else
+        D_FILE="$NGINX_CONF_DIR/conf.d/$1.conf"
+        D_LINK="-"
+    fi
+}
+
+# ---- rendering --------------------------------------------------------------
+render_tls() { # cert key aop
+    local cache='shared:cfngx_ssl:10m'
+    # With client-certificate auth, session resumption across server blocks
+    # has been used to skip verification (CVE-2025-23419): never resume there.
+    (( $3 )) && cache=off
+    cat <<EOF
+
+    ssl_certificate     $1;
+    ssl_certificate_key $2;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         $TLS_CIPHERS;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache   $cache;
+    ssl_session_tickets off;
+EOF
+}
+
+render_common() { # hsts max_body
+    cat <<'EOF'
+
+    server_tokens off;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+EOF
+    (( $1 )) && echo '    add_header Strict-Transport-Security "max-age=31536000" always;'
+    [[ -n "$2" ]] && printf '    client_max_body_size %s;\n' "$2"
+    return 0
+}
+
+render_content() { # mode proxy root
+    local mode="$1" proxy="$2" root="$3"
+    echo
+    if [[ -n "$proxy" ]]; then
+        echo '    location / {'
+        printf '        proxy_pass %s;\n' "$proxy"
+        echo '        proxy_http_version 1.1;'
+        echo '        proxy_set_header Host $host;'
+        echo '        proxy_set_header Upgrade $http_upgrade;'
+        echo '        proxy_set_header Connection $cf_conn_upgrade;'
+        if [[ "$mode" == tunnel ]]; then
+            # Only cloudflared on loopback can reach this server, so its
+            # CF-* headers are trusted; real-ip already put the visitor in
+            # $remote_addr.
+            echo '        proxy_set_header X-Real-IP         $remote_addr;'
+            echo '        proxy_set_header X-Forwarded-For   $remote_addr;'
+            echo '        proxy_set_header X-Forwarded-Proto https;'
+            echo '        proxy_set_header X-Forwarded-Host  $host;'
+        else
+            printf '        include %s/proxy-headers.conf;\n' "$CF_DIR"
+        fi
+        [[ "$proxy" == https://* ]] && echo '        proxy_ssl_server_name on;'
+        echo '    }'
+    else
+        printf '    root %s;\n' "$root"
+        echo '    index index.html index.htm;'
+        echo
+        echo '    # Never serve dotfiles such as .git/ or .env'
+        echo '    location ~ /\.(?!well-known/) { deny all; }'
+        echo
+        echo '    location / {'
+        echo '        try_files $uri $uri/ =404;'
+        echo '    }'
+    fi
+}
+
+render_listen() { # addr port extra
+    if [[ -n "$1" ]]; then
+        printf '    listen %s:%s%s;\n' "$1" "$2" "$3"
+    else
+        printf '    listen %s%s;\n' "$2" "$3"
+        have_ipv6 && printf '    listen [::]:%s%s;\n' "$2" "$3"
+    fi
+    return 0
+}
+
+render_domain() { # uses D_* globals
+    local names="${D_NAMES[*]}" ssl=" ssl" h2=0 allow a
+    if version_ge "$(nginx_version)" 1.25.1; then h2=1; else ssl=" ssl http2"; fi
+    printf '%s %s mode=%s\n' "$DOMAIN_MARK" "$D_NAME" "$D_MODE"
+    printf '# Generated by cf-nginx %s. Re-run `cf-nginx domain add` to change it (a backup\n' "$VERSION"
+    printf '# is kept in %s/backups); `cf-nginx domain remove %s` to delete it.\n' "$STATE_DIR" "$D_NAME"
+
+    case "$D_MODE" in
+    public)
+        echo
+        echo "# Public site behind Cloudflare. Only Cloudflare (and ORIGIN_LOCK_ALLOW) may connect."
+        echo "# Cloudflare dashboard: proxy the DNS record (orange cloud), SSL/TLS mode Full (strict)."
+        echo "server {"
+        render_listen "" 80 ""
+        printf '    server_name %s;\n' "$names"
+        is_yes "$GLOBAL_REAL_IP" || printf '    include %s/real-ip.conf;\n' "$CF_DIR"
+        printf '    include %s/origin-lock.conf;\n' "$CF_DIR"
+        echo '    server_tokens off;'
+        echo '    return 301 https://$host$request_uri;'
+        echo "}"
+        echo
+        echo "server {"
+        render_listen "" 443 "$ssl"
+        (( h2 )) && echo '    http2 on;'
+        printf '    server_name %s;\n' "$names"
+        is_yes "$GLOBAL_REAL_IP" || printf '    include %s/real-ip.conf;\n' "$CF_DIR"
+        printf '    include %s/origin-lock.conf;\n' "$CF_DIR"
+        (( D_AOP )) && printf '    include %s/origin-pull.conf;\n' "$CF_DIR"
+        render_tls "$D_CERT" "$D_KEY" "$D_AOP"
+        render_common "$D_HSTS" "$D_MAXBODY"
+        printf '    access_log /var/log/nginx/%s.access.log cloudflare;\n' "$D_SLUG"
+        render_content public "$D_PROXY" "$D_ROOT"
+        echo "}"
+        ;;
+    local)
+        allow="${D_ALLOW:-$LOCAL_NETS}"
+        echo
+        echo "# Local / homelab site. Only these networks may connect: $allow"
+        echo "server {"
+        render_listen "$D_LISTEN" 80 ""
+        printf '    server_name %s;\n' "$names"
+        for a in $allow; do printf '    allow %s;\n' "$a"; done
+        echo '    deny all;'
+        echo '    server_tokens off;'
+        echo '    return 301 https://$host$request_uri;'
+        echo "}"
+        echo
+        echo "server {"
+        render_listen "$D_LISTEN" 443 "$ssl"
+        (( h2 )) && echo '    http2 on;'
+        printf '    server_name %s;\n' "$names"
+        for a in $allow; do printf '    allow %s;\n' "$a"; done
+        echo '    deny all;'
+        render_tls "$D_CERT" "$D_KEY" 0
+        render_common "$D_HSTS" "$D_MAXBODY"
+        printf '    access_log /var/log/nginx/%s.access.log;\n' "$D_SLUG"
+        render_content local "$D_PROXY" "$D_ROOT"
+        echo "}"
+        ;;
+    tunnel)
+        echo
+        echo "# Cloudflare Tunnel origin: bound to loopback only, so nothing is exposed to"
+        echo "# the network. Point cloudflared at http://127.0.0.1:$D_PORT for $names."
+        echo "server {"
+        printf '    listen 127.0.0.1:%s;\n' "$D_PORT"
+        have_ipv6 && printf '    listen [::1]:%s;\n' "$D_PORT"
+        printf '    server_name %s;\n' "$names"
+        if (( REALIP_MODULE )); then
+            echo '    set_real_ip_from 127.0.0.1;'
+            have_ipv6 && echo '    set_real_ip_from ::1;'
+            echo '    real_ip_header CF-Connecting-IP;'
+        fi
+        render_common "$D_HSTS" "$D_MAXBODY"
+        printf '    access_log /var/log/nginx/%s.access.log;\n' "$D_SLUG"
+        render_content tunnel "$D_PROXY" "$D_ROOT"
+        echo "}"
+        ;;
+    esac
+}
+
+# Catch-all for port 443: refuse TLS for unknown names, so scanning the
+# server's IP does not reveal which domains (or which certificate) it hosts.
+CATCHALL_FILE=""
+catchall_wanted() {
+    [[ -f "$DOMAINS_DB" ]] && awk -F'\t' '$2 == "public" { f = 1 } END { exit !f }' "$DOMAINS_DB"
+}
+catchall_sync() { # -> 0 ok; leaves things as they were when nginx -t fails
+    CATCHALL_FILE="$NGINX_CONF_DIR/conf.d/00-cf-nginx-default-tls.conf"
+    [[ -d "$NGINX_CONF_DIR/conf.d" ]] || return 0
+    if ! catchall_wanted; then
+        [[ -f "$CATCHALL_FILE" ]] && rm -f -- "$CATCHALL_FILE"
+        return 0
+    fi
+    [[ -f "$CATCHALL_FILE" ]] && return 0
+    version_ge "$(nginx_version)" 1.19.4 || { warn "nginx < 1.19.4 has no ssl_reject_handshake; consider a default_server for port 443"; return 0; }
+    if "$NGINX_BIN" -T 2>/dev/null | grep -qE '^[^#]*listen[^;#]*443[^;#]*default_server'; then
+        info "another default_server already handles port 443; not adding a TLS catch-all"
+        return 0
+    fi
+    {
+        echo "# Generated by cf-nginx: reject TLS handshakes for names this server does not host."
+        local opts="ssl"
+        version_ge "$(nginx_version)" 1.25.1 || opts="ssl http2"   # match our sites' listen options
+        echo "server {"
+        echo "    listen 443 $opts default_server;"
+        have_ipv6 && echo "    listen [::]:443 $opts default_server;"
+        echo "    ssl_reject_handshake on;"
+        echo "    ssl_session_tickets off;"
+        echo "}"
+    } > "$CATCHALL_FILE"
+    chmod 0644 "$CATCHALL_FILE"
+    if ! nginx_test; then
+        rm -f -- "$CATCHALL_FILE"
+        warn "could not add the TLS catch-all server; continuing without it"
+    fi
+    return 0
+}
+
+# Remove a generated site from nginx (file + enable link). 0 ok.
+domain_unlink() { # name
+    local row mode file link
+    row="$(domains_db_get "$1")" || return 0
+    IFS=$'\t' read -r mode file link <<< "$row"
+    [[ "$link" != - && -L "$link" ]] && rm -f -- "$link"
+    if [[ -f "$file" ]] && head -n1 "$file" | grep -qF "$DOMAIN_MARK"; then
+        backup_file "$file" >/dev/null
+        rm -f -- "$file"
+    fi
+    : "$mode"
+}
+
+# ---- commands ---------------------------------------------------------------
+cmd_domain() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        add)          cmd_domain_add "$@" ;;
+        csr)          cmd_domain_csr "$@" ;;
+        remove|rm)    cmd_domain_remove "$@" ;;
+        list|ls)      cmd_domain_list ;;
+        *) die "usage: $PROG domain add|csr|remove|list (see '$PROG --help')" ;;
+    esac
+}
+
+need_arg() { [[ $2 -ge 2 ]] || die "$1 needs a value"; }
+
+parse_names() { # primary aliases... -> D_NAMES (validated, unique)
+    local n
+    D_NAMES=()
+    for n in "$@"; do
+        n="${n,,}"
+        valid_domain "$n" || die "invalid domain name '$n'"
+        [[ " ${D_NAMES[*]} " == *" $n "* ]] || D_NAMES+=("$n")
+    done
+}
+
+cmd_domain_csr() {
+    local name="" a aliases=()
+    while (( $# )); do
+        case "$1" in
+            --alias) [[ $# -ge 2 ]] || die "--alias needs a name"; aliases+=("$2"); shift ;;
+            -*) die "unknown option $1" ;;
+            *) [[ -z "$name" ]] || die "only one domain at a time"; name="$1" ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || die "usage: $PROG domain csr <domain> [--alias NAME]..."
+    require_root domain csr
+    need_openssl
+    parse_names "$name" "${aliases[@]+"${aliases[@]}"}"
+    local slug dir
+    slug="$(domain_slug "${D_NAMES[0]}")"; dir="$CERTS_DIR/$slug"
+    ( umask 077; mkdir -p "$dir" ); chmod 0700 "$CERTS_DIR" "$dir"
+    if [[ -f "$dir/key.pem" ]]; then
+        info "reusing the existing private key in $dir"
+    else
+        a="$(tmpf)"; make_key "$a"
+        install -m 0600 "$a" "$dir/key.pem"
+    fi
+    make_csr "$dir/key.pem" "$dir/csr.pem" "${D_NAMES[@]}"
+    chmod 0644 "$dir/csr.pem"
+    ok "private key: $dir/key.pem (stays on this server)"
+    ok "CSR:         $dir/csr.pem"
+    info ""
+    info "Paste this CSR into Cloudflare (SSL/TLS > Origin Server > Create Certificate >"
+    info "'Use my private key and CSR') or give it to any CA, then run:"
+    info "  sudo $PROG domain add ${D_NAMES[0]} --public --cert /path/to/cert.pem --proxy http://127.0.0.1:3000"
+    info ""
+    cat "$dir/csr.pem"
+}
+
+cmd_domain_add() {
+    local name="" aliases=() cert_src="" key_src="" origin_ca=0 self=0 token_file=""
+    D_MODE="" D_PROXY="" D_ROOT="" D_HSTS=0 D_AOP=0 D_ALLOW="" D_LISTEN="" D_PORT=8080 D_MAXBODY=""
+    local port_set=0
+    while (( $# )); do
+        case "$1" in
+            --public|--local|--tunnel)
+                [[ -z "$D_MODE" || "$D_MODE" == "${1#--}" ]] || die "choose one of --public, --local or --tunnel"
+                D_MODE="${1#--}" ;;
+            --mode) need_arg "$1" $#; [[ "$2" =~ ^(public|local|tunnel)$ ]] || die "--mode is public, local or tunnel"; D_MODE="$2"; shift ;;
+            --alias) need_arg "$1" $#; aliases+=("$2"); shift ;;
+            --proxy) need_arg "$1" $#; D_PROXY="$2"; shift ;;
+            --root) need_arg "$1" $#; D_ROOT="$2"; shift ;;
+            --cert) need_arg "$1" $#; cert_src="$2"; shift ;;
+            --key) need_arg "$1" $#; key_src="$2"; shift ;;
+            --origin-ca) origin_ca=1 ;;
+            --token-file) need_arg "$1" $#; token_file="$2"; shift ;;
+            --self-signed) self=1 ;;
+            --hsts) D_HSTS=1 ;;
+            --origin-pull) D_AOP=1 ;;
+            --allow) need_arg "$1" $#; D_ALLOW+="${D_ALLOW:+ }$2"; shift ;;
+            --listen) need_arg "$1" $#; D_LISTEN="$2"; shift ;;
+            --port) need_arg "$1" $#; D_PORT="$2"; port_set=1; shift ;;
+            --max-body) need_arg "$1" $#; D_MAXBODY="$2"; shift ;;
+            -*) die "unknown option $1" ;;
+            *) [[ -z "$name" ]] || die "only one domain at a time (use --alias for more names)"; name="$1" ;;
+        esac
+        shift
+    done
+    [[ -n "$name" ]] || die "usage: $PROG domain add <domain> --public|--local|--tunnel --proxy URL|--root DIR [options]"
+    [[ -n "$D_MODE" ]] || die "choose where this site lives: --public (VPS behind Cloudflare), --local (homelab/LAN) or --tunnel (cloudflared)"
+    parse_names "$name" "${aliases[@]+"${aliases[@]}"}"
+    D_NAME="${D_NAMES[0]}"
+    D_SLUG="$(domain_slug "$D_NAME")"
+
+    # ---- validate everything before touching anything -------------------
+    [[ -n "$D_PROXY" || -n "$D_ROOT" ]] || die "say what to serve: --proxy http://127.0.0.1:3000 or --root /var/www/site"
+    [[ -z "$D_PROXY" || -z "$D_ROOT" ]] || die "use either --proxy or --root, not both"
+    if [[ -n "$D_PROXY" ]]; then valid_proxy_url "$D_PROXY" || die "invalid --proxy URL '$D_PROXY' (e.g. http://127.0.0.1:3000)"; fi
+    if [[ -n "$D_ROOT" ]]; then
+        valid_root_dir "$D_ROOT" || die "--root must be an existing directory with a plain path, outside /etc, /root, /proc, /sys, /dev, /boot, /run and /var/lib"
+        D_ROOT="$(readlink -f "$D_ROOT")"
+        [[ "$(stat -c %a "$D_ROOT")" =~ [2367].$ ]] && warn "$D_ROOT is world-writable"
+    fi
+    [[ -z "$D_MAXBODY" || "$D_MAXBODY" =~ ^[0-9]{1,6}[kKmMgG]?$ ]] || die "--max-body must look like 64m"
+    [[ "$D_PORT" =~ ^[0-9]{1,5}$ ]] && (( D_PORT >= 1 && D_PORT <= 65535 )) || die "--port must be 1-65535"
+    if [[ -n "$D_LISTEN" ]]; then
+        [[ "$D_MODE" == local ]] || die "--listen is only for --local (public listens everywhere, tunnel on loopback)"
+        if valid_v6_addr "$D_LISTEN"; then D_LISTEN="[$D_LISTEN]"
+        elif ! valid_v4_addr "$D_LISTEN"; then die "--listen must be an IP address of this host"; fi
+    fi
+    if [[ -n "$D_ALLOW" ]]; then
+        [[ "$D_MODE" == local ]] || die "--allow is only for --local (public sites use ORIGIN_LOCK_ALLOW)"
+        for a in $D_ALLOW; do
+            valid_v4_cidr "$a" 0 || valid_v6_cidr "$a" 0 || valid_v4_addr "$a" || valid_v6_addr "$a" \
+                || die "--allow '$a' is not an IP or CIDR"
+            [[ "$a" == 0.0.0.0/0 || "$a" == ::/0 ]] && die "--allow $a would expose the site to everyone; use --public behind Cloudflare instead"
+        done
+    fi
+    (( ! D_AOP )) || [[ "$D_MODE" == public ]] || die "--origin-pull is only for --public"
+    (( ! port_set )) || [[ "$D_MODE" == tunnel ]] || die "--port is only for --tunnel"
+    local how=$(( origin_ca + self )) ; [[ -n "$cert_src" ]] && how=$((how + 1))
+    (( how <= 1 )) || die "use only one of --cert, --origin-ca or --self-signed"
+    if [[ "$D_MODE" == tunnel ]]; then
+        (( how == 0 )) || die "--tunnel serves plain HTTP on loopback; cloudflared handles TLS, so no certificate is needed"
+    fi
+    (( ! origin_ca )) || [[ "$D_MODE" == public ]] || die "--origin-ca certificates are only trusted through Cloudflare's proxy; use --public (or --tunnel without a certificate)"
+    if (( self )) && [[ "$D_MODE" == public ]]; then
+        warn "self-signed certificate: set Cloudflare SSL/TLS to Full (not strict), or better use --origin-ca"
+    fi
+
+    preflight domain add
+    [[ -f "$CF_DIR/http.conf" ]] || die "snippets not generated yet; run '$PROG setup' first"
+    http_layer_loaded || die "$CF_DIR/http.conf is not loaded by nginx; add 'include $CF_DIR/http.conf;' inside http {} (see '$PROG status')"
+    if (( D_AOP )); then [[ -f "$CF_DIR/origin-pull.conf" ]] || die "run '$PROG origin-pull on' first"; fi
+    if [[ "$D_MODE" == tunnel ]] && (( ! REALIP_MODULE )); then warn "no realip module: logs will show 127.0.0.1 instead of visitor IPs"; fi
+
+    domain_paths "$D_SLUG"
+    if [[ -e "$D_FILE" ]] && ! head -n1 "$D_FILE" | grep -qF "$DOMAIN_MARK"; then
+        die "$D_FILE already exists and was not created by cf-nginx; move it away or pick another name"
+    fi
+    if [[ "$D_LINK" != - && -e "$D_LINK" && ! -L "$D_LINK" ]]; then
+        die "$D_LINK exists and is not a symlink; refusing to overwrite it"
+    fi
+
+    # ---- certificate ------------------------------------------------------
+    local dir="$CERTS_DIR/$D_SLUG" new_c new_k cert_changed=0
+    D_CERT="$dir/cert.pem" D_KEY="$dir/key.pem"
+    if [[ "$D_MODE" != tunnel ]]; then
+        need_openssl
+        new_c="$(tmpf)"; new_k="$(tmpf)"
+        if [[ -n "$cert_src" ]]; then
+            [[ -f "$cert_src" ]] || die "certificate $cert_src not found"
+            cp -- "$cert_src" "$new_c"
+            if [[ -n "$key_src" ]]; then
+                [[ -f "$key_src" ]] || die "key $key_src not found"
+                cp -- "$key_src" "$new_k"
+            elif [[ -f "$dir/key.pem" ]]; then
+                cp -- "$dir/key.pem" "$new_k"          # from `cf-nginx domain csr`
+            else
+                die "--cert needs --key FILE (or create the key here first with '$PROG domain csr $D_NAME')"
+            fi
+            cert_changed=1
+        elif (( origin_ca )); then
+            local csr; csr="$(tmpf)"
+            if [[ -f "$dir/key.pem" ]]; then cp -- "$dir/key.pem" "$new_k"; else make_key "$new_k"; fi
+            make_csr "$new_k" "$csr" "${D_NAMES[@]}"
+            cf_origin_ca_issue "$csr" "$new_c" "$token_file" "${D_NAMES[@]}"
+            cert_changed=1
+        elif (( self )); then
+            make_self_signed "$new_k" "$new_c" "${D_NAMES[@]}"
+            cert_changed=1
+        elif [[ -f "$dir/cert.pem" && -f "$dir/key.pem" ]]; then
+            info "reusing the certificate in $dir"
+            cp -- "$dir/cert.pem" "$new_c"; cp -- "$dir/key.pem" "$new_k"
+        else
+            read_pem "Paste the certificate (PEM, e.g. from Cloudflare > SSL/TLS > Origin Server), then an empty line:" "$new_c" 0
+            if [[ -f "$dir/key.pem" ]]; then cp -- "$dir/key.pem" "$new_k"
+            else read_pem "Paste the private key (hidden), then an empty line:" "$new_k" 1; fi
+            cert_changed=1
+        fi
+        cert_check "$new_c" "$new_k" "$D_MODE" "${D_NAMES[@]}"
+    fi
+
+    # ---- write, test, roll back on failure ---------------------------------
+    local site_new old_site="" old_certs=""
+    site_new="$(tmpf)"
+    render_domain > "$site_new"
+    if [[ -f "$D_FILE" ]]; then old_site="$(backup_file "$D_FILE")"; fi
+    if (( cert_changed )); then
+        ( umask 077; mkdir -p "$dir" ); chmod 0700 "$CERTS_DIR" "$dir"
+        if [[ -f "$dir/cert.pem" ]]; then
+            old_certs="$TMPD/old-certs"; mkdir -p "$old_certs"
+            cp -p -- "$dir/cert.pem" "$dir/key.pem" "$old_certs/"
+        fi
+        install -m 0600 "$new_k" "$dir/.key.new" && mv -f "$dir/.key.new" "$dir/key.pem"
+        install -m 0644 "$new_c" "$dir/.cert.new" && mv -f "$dir/.cert.new" "$dir/cert.pem"
+    fi
+    install -m 0644 "$site_new" "$D_FILE.cf-nginx-new" && mv -f "$D_FILE.cf-nginx-new" "$D_FILE"
+    local new_link=0
+    if [[ "$D_LINK" != - && ! -L "$D_LINK" ]]; then ln -s "$D_FILE" "$D_LINK"; new_link=1; fi
+
+    if ! nginx_test; then
+        err "nginx -t failed with the new site; rolling back"
+        if [[ -n "$old_site" ]]; then cp -p -- "$old_site" "$D_FILE"; else rm -f -- "$D_FILE"; fi
+        (( new_link )) && rm -f -- "$D_LINK"
+        if [[ -n "$old_certs" ]]; then
+            cp -p -- "$old_certs/cert.pem" "$old_certs/key.pem" "$dir/"
+        elif (( cert_changed )) && [[ -z "$old_site" ]]; then
+            rm -f -- "$dir/cert.pem"
+        fi
+        nginx_test || err "nginx config still invalid after rollback; manual attention required"
+        exit 1
+    fi
+    domains_db_set "$D_NAME" "$D_MODE" "$D_FILE" "$D_LINK"
+    [[ "$D_MODE" == public ]] && catchall_sync
+    nginx_reload
+    ok "$D_NAME ($D_MODE) -> $D_FILE"
+    nginx_loaded_files | grep -qxF "$D_FILE" || warn "$D_FILE is not loaded by nginx (check the include lines in nginx.conf)"
+
+    info ""
+    case "$D_MODE" in
+        public)
+            info "Next, in the Cloudflare dashboard:"
+            info "  - DNS: A/AAAA record for ${D_NAMES[*]} -> this server, Proxied (orange cloud)"
+            info "  - SSL/TLS: Full (strict)$( (( self )) && echo ' -- or Full while using a self-signed cert')"
+            if (( D_AOP )); then info "  - SSL/TLS > Origin Server: turn on Authenticated Origin Pulls"; fi
+            is_yes "$UFW_SYNC" || info "Recommended on a VPS: 'sudo ufw allow OpenSSH && sudo $PROG ufw on' so only Cloudflare reaches 80/443."
+            ;;
+        local)
+            info "Point ${D_NAMES[*]} at this server in your LAN DNS (router, Pi-hole, AdGuard or /etc/hosts)."
+            if (( self )); then info "Browsers will warn about the self-signed certificate; import $dir/cert.pem on your devices to trust it."; fi
+            ;;
+        tunnel)
+            info "cloudflared config (~/.cloudflared/config.yml):"
+            info "  ingress:"
+            local n; for n in "${D_NAMES[@]}"; do
+                info "    - hostname: $n"
+                info "      service: http://127.0.0.1:$D_PORT"
+            done
+            info "    - service: http_status:404"
+            ;;
+    esac
+}
+
+cmd_domain_remove() {
+    local name="" keys=0 a
+    for a in "$@"; do
+        case "$a" in
+            --delete-keys) keys=1 ;;
+            -*) die "unknown option $a" ;;
+            *) [[ -z "$name" ]] || die "only one domain at a time"; name="${a,,}" ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "usage: $PROG domain remove <domain> [--delete-keys]"
+    valid_domain "$name" || die "invalid domain name '$name'"
+    preflight domain remove
+    domains_db_get "$name" >/dev/null || die "$name is not managed by cf-nginx (see '$PROG domain list')"
+    local row mode file link bak=""
+    row="$(domains_db_get "$name")"
+    IFS=$'\t' read -r mode file link <<< "$row"
+    [[ -f "$file" ]] && bak="$TMPD/site.bak" && cp -p -- "$file" "$bak"
+    domain_unlink "$name"
+    if ! nginx_test; then
+        [[ -n "$bak" ]] && cp -p -- "$bak" "$file"
+        [[ "$link" != - && -n "$bak" ]] && ln -sf "$file" "$link"
+        die "nginx -t failed without $name (does another config reference it?); restored"
+    fi
+    domains_db_del "$name"
+    catchall_sync
+    nginx_reload
+    if (( keys )); then
+        rm -rf -- "${CERTS_DIR:?}/$(domain_slug "$name")"
+        ok "removed $name and its keys"
+    else
+        ok "removed $name ($mode); keys kept in $CERTS_DIR/$(domain_slug "$name") (use --delete-keys to remove)"
+    fi
+}
+
+cmd_domain_list() {
+    [[ -s "$DOMAINS_DB" ]] || { echo "no domains yet (try: $PROG domain add example.com --public --origin-ca --proxy http://127.0.0.1:3000)"; return 0; }
+    local name mode file link cert end
+    printf '%-32s %-7s %s\n' DOMAIN MODE CERTIFICATE
+    while IFS=$'\t' read -r name mode file link; do
+        cert="$CERTS_DIR/$(domain_slug "$name")/cert.pem"
+        if [[ "$mode" == tunnel ]]; then end="(cloudflared terminates TLS)"
+        elif [[ -r "$cert" ]] && command -v openssl >/dev/null 2>&1; then
+            end="expires $(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)"
+            openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 || end="EXPIRED"
+        else end="missing"; fi
+        printf '%-32s %-7s %s\n' "$name" "$mode" "$end"
+    done < "$DOMAINS_DB"
+    : "$file" "$link"
+}
+
+# For `status`: 1 if any certificate is expired, missing or expires in 14 days.
+domains_status() {
+    [[ -s "$DOMAINS_DB" ]] || { echo "    (none; use '$PROG domain add')"; return 0; }
+    local name mode file link cert bad=0 note
+    while IFS=$'\t' read -r name mode file link; do
+        note="ok"
+        cert="$CERTS_DIR/$(domain_slug "$name")/cert.pem"
+        if [[ ! -f "$file" ]]; then note="site file missing"; bad=1
+        elif [[ "$mode" != tunnel ]]; then
+            if [[ ! -f "$cert" ]]; then note="certificate missing"; bad=1
+            elif ! openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then note="CERTIFICATE EXPIRED"; bad=1
+            elif ! openssl x509 -in "$cert" -noout -checkend 1209600 >/dev/null 2>&1; then note="certificate expires within 14 days"; bad=1
+            fi
+        fi
+        printf '    %s  [%s] %s\n' "$name" "$mode" "$note"
+    done < "$DOMAINS_DB"
+    : "$link"
+    return "$bad"
+}
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 cmd_update() {
@@ -1066,11 +1837,26 @@ cmd_uninstall() { # remove all nginx/firewall integration; files are removed by 
     done
     require_root uninstall
     take_lock
-    local have_nginx=1
+    local have_nginx=1 i=0
     ( detect_nginx ) >/dev/null 2>&1 || have_nginx=0
     if (( have_nginx )); then
         detect_nginx
-        local f files=()
+        local f files=() dn dfile dlink keep="$TMPD/keep"
+        mkdir -p "$keep/domains"
+        # Generated domain sites use our snippets and keys: take them out of
+        # nginx first. Kept in $keep so a refused uninstall can put them back.
+        local catchall="$NGINX_CONF_DIR/conf.d/00-cf-nginx-default-tls.conf"
+        [[ -f "$catchall" ]] && cp -p -- "$catchall" "$keep/catchall.conf"
+        rm -f -- "$catchall"
+        if [[ -s "$DOMAINS_DB" ]]; then
+            cp -p -- "$DOMAINS_DB" "$keep/domains.db"
+            while IFS=$'\t' read -r dn _ dfile dlink; do
+                i=$((i + 1))
+                [[ -f "$dfile" ]] && cp -p -- "$dfile" "$keep/domains/$i"
+                domain_unlink "$dn"
+            done < "$keep/domains.db"
+            rm -f -- "$DOMAINS_DB"
+        fi
         [[ -f "$SITES_DB" ]] && while IFS=$'\t' read -r f _; do files+=("$f"); done < "$SITES_DB"
         while IFS= read -r f; do files+=("$f"); done < <(grep -rlsF "$MARK" "$NGINX_CONF_DIR" 2>/dev/null | grep -v "^$CF_DIR/" || true)
         if (( ${#files[@]} )); then
@@ -1078,8 +1864,6 @@ cmd_uninstall() { # remove all nginx/firewall integration; files are removed by 
         fi
         # Keep a copy: if hand-written config still uses our snippets or
         # $cf_* variables, removing them would break nginx on next restart.
-        local keep="$TMPD/keep"
-        mkdir -p "$keep"
         [[ -d "$CF_DIR" ]] && cp -a "$CF_DIR" "$keep/cloudflare"
         [[ -f "$HOOK_FILE" ]] && cp -a "$HOOK_FILE" "$keep/hook.conf"
         rm -f -- "$HOOK_FILE"
@@ -1089,6 +1873,16 @@ cmd_uninstall() { # remove all nginx/firewall integration; files are removed by 
         else
             [[ -d "$keep/cloudflare" ]] && cp -a "$keep/cloudflare" "$CF_DIR"
             [[ -f "$keep/hook.conf" ]] && cp -a "$keep/hook.conf" "$HOOK_FILE"
+            [[ -f "$keep/catchall.conf" ]] && cp -p -- "$keep/catchall.conf" "$catchall"
+            if [[ -f "$keep/domains.db" ]]; then
+                i=0
+                while IFS=$'\t' read -r dn _ dfile dlink; do
+                    i=$((i + 1))
+                    [[ -f "$keep/domains/$i" ]] && cp -p -- "$keep/domains/$i" "$dfile"
+                    [[ "$dlink" != - ]] && ln -sfn "$dfile" "$dlink"
+                done < "$keep/domains.db"
+                cp -p -- "$keep/domains.db" "$DOMAINS_DB"
+            fi
             err "your nginx config still references cf-nginx snippets or \$cf_* variables:"
             grep -rnsE "$CF_DIR/|\\\$cf_[a-z_]+" "$NGINX_CONF_DIR" 2>/dev/null | grep -v "^$CF_DIR/" | grep -v "^$HOOK_FILE:" | head -n 20 >&2 || true
             die "remove those references, then run '$PROG uninstall' again (nothing was removed from nginx)"
@@ -1105,6 +1899,7 @@ cmd_uninstall() { # remove all nginx/firewall integration; files are removed by 
     else
         rm -f -- "$SITES_DB"
     fi
+    (( i == 0 )) || warn "$i domain site(s) were disabled; their keys are in $CERTS_DIR$( (( purge )) && echo ' (now deleted)')"
     ok "cf-nginx integration removed"
 }
 
@@ -1141,6 +1936,8 @@ cmd_status() {
         else echo "  schedule:         NONE"; problems=1; fi
     elif [[ -f /etc/cron.d/cf-nginx ]]; then echo "  schedule:         cron"
     else echo "  schedule:         NONE"; problems=1; fi
+    echo "  domains:"
+    domains_status || problems=1
     echo "  sites:"
     if [[ -s "$SITES_DB" ]]; then
         local f fl
@@ -1216,6 +2013,22 @@ Sites (edits only marked 'include' lines, with backup + nginx -t + rollback)
                               or a path to a config file
   disable <site>              Remove cf-nginx includes from a site
 
+Domains (generates a hardened TLS site per domain; nginx -t + rollback)
+  domain add <domain> --public|--local|--tunnel --proxy URL|--root DIR
+        --public              VPS behind Cloudflare: only Cloudflare may connect
+        --local               homelab/LAN: only private networks may connect
+        --tunnel              cloudflared on this host: loopback only, no open ports
+        --origin-ca           get a 15-year Cloudflare Origin CA cert (API token
+                              from CF_API_TOKEN, --token-file FILE or a prompt)
+        --cert FILE [--key FILE]  use your own certificate (e.g. Let's Encrypt)
+        --self-signed         generate one (homelab / testing)
+        --alias NAME          extra hostname (repeatable)
+        --hsts --origin-pull --max-body 64m
+        --allow CIDR --listen IP   (local)    --port N (tunnel, default 8080)
+  domain csr <domain>         Make a private key + CSR here (key never leaves)
+  domain remove <domain> [--delete-keys]
+  domain list                 Domains, modes and certificate expiry
+
 Features
   global-real-ip on|off       Real visitor IP for all sites (http level)
   origin-pull on|off          Manage Authenticated Origin Pulls (mTLS) snippet
@@ -1243,6 +2056,8 @@ main() {
     load_config
     validate_config
     SITES_DB="$STATE_DIR/sites"
+    DOMAINS_DB="$STATE_DIR/domains"
+    CERTS_DIR="${CF_NGINX_CERTS_DIR:-$(dirname "$CONFIG_FILE")/certs}"
     UFW_DB="$STATE_DIR/ufw-rules"
 
     local cmd="${1:-help}"
@@ -1252,6 +2067,7 @@ main() {
         update)         cmd_update "$@" ;;
         enable)         cmd_enable "$@" ;;
         disable)        cmd_disable "$@" ;;
+        domain|domains) cmd_domain "$@" ;;
         status|check)   cmd_status "$@" ;;
         global-real-ip) cmd_global_real_ip "$@" ;;
         origin-pull)    cmd_origin_pull "$@" ;;
