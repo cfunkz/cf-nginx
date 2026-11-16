@@ -264,4 +264,4 @@ make dist      # deb + source zip
 ```
 ## License
 
-Apache-2.0
+MIT
